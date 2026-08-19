@@ -127,9 +127,15 @@ def resolved_edit_date(date_mode,custom_date):
     if date_mode=='yesterday': return today-timedelta(days=1)
     if date_mode=='custom':
         if not custom_date: return None
-        try: return datetime.strptime(custom_date,'%Y-%m-%d').date()
-        except ValueError: return None
+        raw=str(custom_date).strip()
+        raw=(raw.replace('–','-').replace('—','-').replace('−','-').replace('‑','-').replace('‐','-'))
+        raw=''.join(raw.split())
+        for fmt in ('%Y-%m-%d','%m/%d/%Y'):
+            try: return datetime.strptime(raw,fmt).date()
+            except ValueError: pass
+        return None
     return today
+
 
 def daily_metric_totals(g,metric):
     today=dkey(); c=con(); totals={}
@@ -1113,7 +1119,7 @@ async def backfillsales(
     edit_date=resolved_edit_date(date.value,custom_date)
     if not edit_date:
         return await interaction.response.send_message(
-            '❌ For Custom Date, enter the date like **2026-08-19**.',
+            "❌ I couldn't read that date. Use **2026-08-19** or **08/19/2026**.",
             ephemeral=True
         )
 
@@ -1204,7 +1210,7 @@ async def backfillstats(
     edit_date=resolved_edit_date(date.value,custom_date)
     if not edit_date:
         return await interaction.response.send_message(
-            '❌ For Custom Date, enter the date like **2026-08-19**.',
+            "❌ I couldn't read that date. Use **2026-08-19** or **08/19/2026**.",
             ephemeral=True
         )
 
@@ -1271,7 +1277,7 @@ async def editstats(
 
     edit_date=resolved_edit_date(date.value,custom_date)
     if not edit_date:
-        return await interaction.response.send_message('❌ For Custom Date, enter the date like **2026-08-19**.',ephemeral=True)
+        return await interaction.response.send_message("❌ I couldn't read that date. Use **2026-08-19** or **08/19/2026**.",ephemeral=True)
 
     field=stat.value
     allowed={'appointments','bills','within_48','same_day','sales','closer_sales','pitches','hours'}
