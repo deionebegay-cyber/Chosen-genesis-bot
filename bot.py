@@ -1076,23 +1076,21 @@ BACKFILL_STAT_CHOICES = [
 )
 @app_commands.describe(
     amount='Number of historical sales to add',
-    date='Today, yesterday, or custom date',
+    date='Historical sale date, e.g. 2026-08-01',
     setter='Optional setter to credit',
     closer='Optional team closer to credit',
     outside_team='Turn on only if the closer was outside your team',
     count_team_goal='Should these sales add to the 30-sale team goal?',
     custom_date='Only use with Custom Date, format YYYY-MM-DD'
 )
-@app_commands.choices(date=DATE_CHOICES)
 async def backfillsales(
     interaction:discord.Interaction,
     amount:int,
-    date:app_commands.Choice[str],
+    date:str,
     setter:discord.Member|None=None,
     closer:discord.Member|None=None,
     outside_team:bool=False,
-    count_team_goal:bool=True,
-    custom_date:str|None=None
+    count_team_goal:bool=True
 ):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
@@ -1116,7 +1114,18 @@ async def backfillsales(
             ephemeral=True
         )
 
-    edit_date=resolved_edit_date(date.value,custom_date)
+    # Backfill is historical, so use one simple date field instead of
+    # a Date dropdown plus a separate Custom Date field.
+    raw_date=str(date).strip()
+    raw_date=(raw_date.replace('–','-').replace('—','-').replace('−','-').replace('‑','-').replace('‐','-'))
+    raw_date=''.join(raw_date.split())
+    edit_date=None
+    for fmt in ('%Y-%m-%d','%m/%d/%Y'):
+        try:
+            edit_date=datetime.strptime(raw_date,fmt).date()
+            break
+        except ValueError:
+            pass
     if not edit_date:
         return await interaction.response.send_message(
             "❌ I couldn't read that date. Use **2026-08-19** or **08/19/2026**.",
