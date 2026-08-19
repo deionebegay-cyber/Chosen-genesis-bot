@@ -543,6 +543,12 @@ ACTION_CHOICES = [
 ]
 
 
+DATE_CHOICES = [
+    app_commands.Choice(name='Today', value='today'),
+    app_commands.Choice(name='Yesterday', value='yesterday'),
+    app_commands.Choice(name='Custom Date', value='custom'),
+]
+
 BACKFILL_STAT_CHOICES = [
     app_commands.Choice(name='Appointments', value='appointments'),
     app_commands.Choice(name='Bills', value='bills'),
