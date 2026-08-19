@@ -249,17 +249,32 @@ def progress_bar(value, goal, width=12):
 def team_daily_appointments(guild_id):
     today=dkey()
     c=con()
-    base=c.execute(
-        'SELECT COUNT(*) v FROM appointment_events WHERE guild_id=? AND local_date=?',
+
+    # Count each setter separately, then apply that setter's corrections.
+    # This prevents an old negative correction on one person from incorrectly
+    # reducing the whole team's daily goal counter.
+    totals={}
+
+    rows=c.execute(
+        'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
+        'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
         (guild_id,today)
-    ).fetchone()['v']
-    adj=c.execute(
-        'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
-        'WHERE guild_id=? AND stat_name=? AND local_date=?',
+    ).fetchall()
+    for r in rows:
+        totals[r['user_id']]=float(r['value'] or 0)
+
+    adjustments=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
+        'WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',
         (guild_id,'appointments',today)
-    ).fetchone()['v']
+    ).fetchall()
     c.close()
-    return max(0,int(round(float(base or 0)+float(adj or 0))))
+
+    for r in adjustments:
+        uid=r['user_id']
+        totals[uid]=max(0,totals.get(uid,0)+float(r['value'] or 0))
+
+    return int(round(sum(max(0,v) for v in totals.values())))
 
 def team_monthly_sales(guild_id):
     today=now().date()
@@ -601,6 +616,54 @@ async def sale(interaction:discord.Interaction,setter:discord.Member,closer:disc
     if n.hour>=19:
         await add_role(interaction.guild,closer,'👻 Ghost Hunter'); await main(interaction.guild,content=f'👻 **GHOST HUNTER!** {closer.mention} closed a deal after 7 PM!')
     await refresh_streaks(interaction.guild); await refresh_leaderboard(interaction.guild)
+
+@bot.tree.command(name='goalcheck',description='Manager-only: check today\'s appointment goal count')
+async def goalcheck(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    today=dkey()
+    c=con()
+    rows=c.execute(
+        'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
+        'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+        (interaction.guild.id,today)
+    ).fetchall()
+    adjustments=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
+        'WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',
+        (interaction.guild.id,'appointments',today)
+    ).fetchall()
+    c.close()
+
+    data={}
+    for r in rows:
+        data[r['user_id']]={'logs':float(r['value'] or 0),'adjustments':0}
+    for r in adjustments:
+        data.setdefault(r['user_id'],{'logs':0,'adjustments':0})
+        data[r['user_id']]['adjustments']=float(r['value'] or 0)
+
+    lines=[]
+    for uid,vals in data.items():
+        member=interaction.guild.get_member(uid)
+        name=member.display_name if member else f'<@{uid}>'
+        final=max(0,vals['logs']+vals['adjustments'])
+        lines.append(
+            f"{name}: logs **{vals['logs']:g}**, corrections **{vals['adjustments']:+g}**, counted **{final:g}**"
+        )
+
+    total=team_daily_appointments(interaction.guild.id)
+    text='\n'.join(lines) if lines else 'No appointment activity recorded today.'
+    await interaction.response.send_message(
+        f"**Today's goal count: {total}/{DAILY_APPOINTMENT_GOAL}**\n\n{text}",
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name='leaderboard',description='Refresh the permanent live leaderboard')
 async def leaderboard(interaction:discord.Interaction):
