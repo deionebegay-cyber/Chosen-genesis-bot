@@ -542,6 +542,97 @@ ACTION_CHOICES = [
     app_commands.Choice(name='✏️ Set', value='set'),
 ]
 
+
+BACKFILL_STAT_CHOICES = [
+    app_commands.Choice(name='Appointments', value='appointments'),
+    app_commands.Choice(name='Bills', value='bills'),
+    app_commands.Choice(name='Within 48 Hours', value='within_48'),
+    app_commands.Choice(name='Same Day', value='same_day'),
+    app_commands.Choice(name='Setter Sales', value='sales'),
+    app_commands.Choice(name='Closer Sales', value='closer_sales'),
+]
+
+@bot.tree.command(
+    name='backfillstats',
+    description='Manager-only: assign existing stats to a past date without changing the total'
+)
+@app_commands.describe(
+    member='Member whose existing stats need a date',
+    stat='Which existing stat to date',
+    amount='How many of that stat happened on this date',
+    date='Today, yesterday, or custom date',
+    custom_date='Only use with Custom Date, format YYYY-MM-DD'
+)
+@app_commands.choices(
+    stat=BACKFILL_STAT_CHOICES,
+    date=DATE_CHOICES
+)
+async def backfillstats(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    stat: app_commands.Choice[str],
+    amount: float,
+    date: app_commands.Choice[str],
+    custom_date: str|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            'Use this command inside the server.',
+            ephemeral=True
+        )
+
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can backfill stats.',
+            ephemeral=True
+        )
+
+    if amount <= 0:
+        return await interaction.response.send_message(
+            'Amount must be greater than 0.',
+            ephemeral=True
+        )
+
+    edit_date=resolved_edit_date(date.value,custom_date)
+    if not edit_date:
+        return await interaction.response.send_message(
+            '❌ For Custom Date, enter the date like **2026-08-19**.',
+            ephemeral=True
+        )
+
+    field=stat.value
+    if field != 'hours':
+        amount=int(round(amount))
+
+    # IMPORTANT: this creates dated history only. It does NOT change the saved all-time total.
+    record_adjustment(
+        interaction.guild.id,
+        member.id,
+        field,
+        amount,
+        edit_date.isoformat()
+    )
+
+    await restore_daily(interaction.guild)
+    await refresh_streaks(interaction.guild)
+    await refresh_leaderboard(interaction.guild)
+
+    labels={
+        'appointments':'Appointments',
+        'bills':'Bills',
+        'within_48':'Within 48 Hours',
+        'same_day':'Same Day',
+        'sales':'Setter Sales',
+        'closer_sales':'Closer Sales',
+    }
+
+    await interaction.response.send_message(
+        f"✅ Backfilled **{amount:g} {labels[field]}** for {member.mention} on "
+        f"**{edit_date.isoformat()}**. Their saved all-time total was not changed.",
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name='editstats',description='Manager-only: correct stats and leaderboard history')
 @app_commands.describe(
     member='Member whose stats you want to change',
