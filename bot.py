@@ -38,6 +38,9 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id INTEGER,user_id INTEGER,stat_name TEXT,amount REAL,
       local_date TEXT,week_key TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS team_sale_adjustments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,amount INTEGER,local_date TEXT,created_at TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -184,7 +187,7 @@ def streak(g,u,table,col,needed):
 
 async def refresh_streaks(guild):
     c=con(); setters=[r['setter_id'] for r in c.execute('SELECT DISTINCT setter_id FROM appointment_events WHERE guild_id=?',(guild.id,))]
-    closers=[r['closer_id'] for r in c.execute('SELECT DISTINCT closer_id FROM sale_events WHERE guild_id=?',(guild.id,))]; c.close()
+    closers=[r['closer_id'] for r in c.execute('SELECT DISTINCT closer_id FROM sale_events WHERE guild_id=? AND closer_id>0',(guild.id,))]; c.close()
     await set_holders(guild,'🔥 Hot Streak',[u for u in setters if streak(guild.id,u,'appointment_events','setter_id',5)])
     await set_holders(guild,'🧊 Ice Cold',[u for u in closers if streak(guild.id,u,'sale_events','closer_id',3)])
 
@@ -193,7 +196,7 @@ def week_winners(g,wk,kind):
     if kind=='setter':
         rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND week_key=? GROUP BY setter_id',(g,wk)).fetchall(); stat='appointments'
     else:
-        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND week_key=? GROUP BY closer_id',(g,wk)).fetchall(); stat='closer_sales'
+        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND week_key=? AND closer_id>0 GROUP BY closer_id',(g,wk)).fetchall(); stat='closer_sales'
     for r in rows: totals[r['user_id']]=float(r['value'] or 0)
     adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND week_key=? AND stat_name=? GROUP BY user_id',(g,wk,stat)).fetchall(); c.close()
     for r in adj: totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
@@ -220,7 +223,7 @@ async def restore_daily(guild):
     if f:
         m=guild.get_member(f)
         if m: await add_role(guild,m,'🩸 First Blood')
-    c=con(); rows=c.execute('SELECT closer_id,COUNT(*) c,MAX(local_hour) h FROM sale_events WHERE guild_id=? AND local_date=? GROUP BY closer_id',(guild.id,dkey())).fetchall()
+    c=con(); rows=c.execute('SELECT closer_id,COUNT(*) c,MAX(local_hour) h FROM sale_events WHERE guild_id=? AND local_date=? AND closer_id>0 GROUP BY closer_id',(guild.id,dkey())).fetchall()
     actual={r['closer_id']:{'c':int(r['c'] or 0),'h':int(r['h'] or 0)} for r in rows}
     adj=c.execute('SELECT user_id,SUM(amount) v FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',(guild.id,'closer_sales',dkey())).fetchall(); c.close()
     totals={u:data['c'] for u,data in actual.items()}
@@ -285,23 +288,14 @@ def team_monthly_sales(guild_id):
         'SELECT COUNT(*) v FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
         (guild_id,start,end)
     ).fetchone()['v']
-
-    # Manual sales corrections can be entered on setter or closer sales.
-    # Use the larger side so the same deal is not double-counted if both were corrected.
-    setter_adj=c.execute(
-        'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
-        'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
-        (guild_id,'sales',start,end)
-    ).fetchone()['v']
-    closer_adj=c.execute(
-        'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
-        'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
-        (guild_id,'closer_sales',start,end)
+    manual=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM team_sale_adjustments '
+        'WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild_id,start,end)
     ).fetchone()['v']
     c.close()
+    return max(0,int(round(float(base or 0)+float(manual or 0))))
 
-    manual=max(float(setter_adj or 0),float(closer_adj or 0))
-    return max(0,int(round(float(base or 0)+manual)))
 
 def current_badge_board(guild):
     lines=[]
@@ -422,7 +416,7 @@ def period_rows(guild_id,period,kind):
     elif kind=='setter_sales':
         rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',(guild_id,start,end)).fetchall(); stat='sales'
     else:
-        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY closer_id',(guild_id,start,end)).fetchall(); stat='closer_sales'
+        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? AND closer_id>0 GROUP BY closer_id',(guild_id,start,end)).fetchall(); stat='closer_sales'
     for r in rows: totals[r['user_id']]=float(r['value'] or 0)
     adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ? GROUP BY user_id',(guild_id,stat,start,end)).fetchall(); c.close()
     for r in adj: totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
@@ -526,7 +520,7 @@ def weekly_rank(guild_id,user_id,stat):
             ).fetchall())
     elif stat=='closer_sales':
         user_ids.update(r['closer_id'] for r in c.execute(
-            'SELECT DISTINCT closer_id FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            'SELECT DISTINCT closer_id FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? AND closer_id>0',
             (guild_id,start,end)
         ).fetchall())
     c.close()
@@ -598,24 +592,70 @@ async def appointment(interaction:discord.Interaction,setter:discord.Member,bill
     await refresh_daily_comp(interaction.guild); await refresh_streaks(interaction.guild); await refresh_leaderboard(interaction.guild)
 
 @bot.tree.command(name='sale',description='Log a new sale')
-@app_commands.describe(setter='Setter on the deal',closer='Closer who closed it',utility='APS, SRP, etc.')
-async def sale(interaction:discord.Interaction,setter:discord.Member,closer:discord.Member,utility:str='Unknown'):
+@app_commands.describe(
+    setter='Setter on the deal',
+    closer='Closer who closed it (leave blank for outside team)',
+    outside_team='Turn on if the closer is from another team',
+    utility='APS, SRP, etc.'
+)
+async def sale(
+    interaction:discord.Interaction,
+    setter:discord.Member,
+    outside_team:bool=False,
+    closer:discord.Member|None=None,
+    utility:str='Unknown'
+):
     if not interaction.guild: return
+
+    if not outside_team and closer is None:
+        return await interaction.response.send_message(
+            '❌ Choose a closer, or turn **Outside Team** on.',
+            ephemeral=True
+        )
+
     n=now(); g=interaction.guild.id
-    c=con(); c.execute('INSERT INTO sale_events(guild_id,setter_id,closer_id,utility,local_date,local_hour,week_key,created_at) VALUES(?,?,?,?,?,?,?,?)',(g,setter.id,closer.id,utility,dkey(n.date()),n.hour,wkey(n.date()),datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
-    add(g,setter.id,'sales',1); add(g,closer.id,'closer_sales',1)
-    e=discord.Embed(title='🚨 NEW SALE',description='**CHOSEN GENESIS +1** 🔥',timestamp=datetime.now(timezone.utc)); e.add_field(name='🔥 Setter',value=setter.mention); e.add_field(name='🤝 Closer',value=closer.mention); e.add_field(name='⚡ Utility',value=utility.upper())
-    await interaction.response.send_message('Sale logged ✅',ephemeral=True); await main(interaction.guild,embed=e)
-    count=closer_sales_today(g,closer.id)
-    if count>=1: await add_role(interaction.guild,closer,'💥 Sale')
-    if count==1: await main(interaction.guild,content=f'💥 **SALE BADGE!** {closer.mention} got a sale today!')
-    if count>=2: await add_role(interaction.guild,closer,'🥈 2 Spot')
-    if count==2: await main(interaction.guild,content=f'🥈 **2 SPOT!** {closer.mention} has **2 sales today!**')
-    if count>=3: await add_role(interaction.guild,closer,'🎩 Hattrick')
-    if count==3: await main(interaction.guild,content=f'🎩 **HATTRICK!** {closer.mention} has **3 sales today!** 🔥')
-    if n.hour>=19:
-        await add_role(interaction.guild,closer,'👻 Ghost Hunter'); await main(interaction.guild,content=f'👻 **GHOST HUNTER!** {closer.mention} closed a deal after 7 PM!')
-    await refresh_streaks(interaction.guild); await refresh_leaderboard(interaction.guild)
+    closer_id=0 if outside_team else closer.id
+
+    c=con()
+    c.execute(
+        'INSERT INTO sale_events(guild_id,setter_id,closer_id,utility,local_date,local_hour,week_key,created_at) '
+        'VALUES(?,?,?,?,?,?,?,?)',
+        (g,setter.id,closer_id,utility,dkey(n.date()),n.hour,wkey(n.date()),datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
+    add(g,setter.id,'sales',1)
+    if not outside_team:
+        add(g,closer.id,'closer_sales',1)
+
+    e=discord.Embed(
+        title='🚨 NEW SALE',
+        description='**CHOSEN GENESIS +1** 🔥',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='🔥 Setter',value=setter.mention)
+    e.add_field(name='🤝 Closer',value='**Outside Team**' if outside_team else closer.mention)
+    e.add_field(name='⚡ Utility',value=utility.upper())
+
+    await interaction.response.send_message('Sale logged ✅',ephemeral=True)
+    await main(interaction.guild,embed=e)
+
+    # Outside-team closers never receive closer stats, streaks, or daily closer badges.
+    if not outside_team:
+        count=closer_sales_today(g,closer.id)
+        if count>=1: await add_role(interaction.guild,closer,'💥 Sale')
+        if count==1: await main(interaction.guild,content=f'💥 **SALE BADGE!** {closer.mention} got a sale today!')
+        if count>=2: await add_role(interaction.guild,closer,'🥈 2 Spot')
+        if count==2: await main(interaction.guild,content=f'🥈 **2 SPOT!** {closer.mention} has **2 sales today!**')
+        if count>=3: await add_role(interaction.guild,closer,'🎩 Hattrick')
+        if count==3: await main(interaction.guild,content=f'🎩 **HATTRICK!** {closer.mention} has **3 sales today!** 🔥')
+        if n.hour>=19:
+            await add_role(interaction.guild,closer,'👻 Ghost Hunter')
+            await main(interaction.guild,content=f'👻 **GHOST HUNTER!** {closer.mention} closed a deal after 7 PM!')
+
+    await refresh_streaks(interaction.guild)
+    await refresh_leaderboard(interaction.guild)
+
 
 @bot.tree.command(name='goalcheck',description='Manager-only: check today\'s appointment goal count')
 async def goalcheck(interaction:discord.Interaction):
@@ -921,6 +961,82 @@ BACKFILL_STAT_CHOICES = [
     app_commands.Choice(name='Setter Sales', value='sales'),
     app_commands.Choice(name='Closer Sales', value='closer_sales'),
 ]
+
+@bot.tree.command(
+    name='backfillsales',
+    description='Manager-only: safely add historical sales without daily badges'
+)
+@app_commands.describe(
+    setter='Setter who received credit',
+    amount='Number of historical sales to add',
+    date='Today, yesterday, or custom date',
+    closer='Optional team closer to credit',
+    outside_team='Turn on if the closer was outside your team',
+    custom_date='Only use with Custom Date, format YYYY-MM-DD'
+)
+@app_commands.choices(date=DATE_CHOICES)
+async def backfillsales(
+    interaction:discord.Interaction,
+    setter:discord.Member,
+    amount:int,
+    date:app_commands.Choice[str],
+    outside_team:bool=False,
+    closer:discord.Member|None=None,
+    custom_date:str|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can backfill sales.',
+            ephemeral=True
+        )
+    if amount<=0:
+        return await interaction.response.send_message('Amount must be greater than 0.',ephemeral=True)
+    if not outside_team and closer is None:
+        return await interaction.response.send_message(
+            '❌ Choose the team closer, or turn **Outside Team** on.',
+            ephemeral=True
+        )
+
+    edit_date=resolved_edit_date(date.value,custom_date)
+    if not edit_date:
+        return await interaction.response.send_message(
+            '❌ For Custom Date, enter the date like **2026-08-19**.',
+            ephemeral=True
+        )
+
+    g=interaction.guild.id
+    date_text=edit_date.isoformat()
+
+    # Personal totals + dated leaderboard history.
+    add(g,setter.id,'sales',amount)
+    record_adjustment(g,setter.id,'sales',amount,date_text)
+
+    closer_text='Outside Team'
+    if not outside_team:
+        add(g,closer.id,'closer_sales',amount)
+        record_adjustment(g,closer.id,'closer_sales',amount,date_text)
+        closer_text=closer.mention
+
+    # Count these deals toward the 30-sale team goal without creating sale_events.
+    # Because no sale_event is created, this command NEVER awards Sale/2 Spot/Hattrick/Ghost Hunter.
+    c=con()
+    c.execute(
+        'INSERT INTO team_sale_adjustments(guild_id,amount,local_date,created_at) VALUES(?,?,?,?)',
+        (g,amount,date_text,datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
+    await refresh_leaderboard(interaction.guild)
+
+    await interaction.response.send_message(
+        f'✅ Safely added **{amount} historical sale(s)** on **{date_text}**.\n'
+        f'Setter: {setter.mention}\nCloser: {closer_text}\n\n'
+        f'No Sale, 2 Spot, Hattrick, or Ghost Hunter badges were triggered.',
+        ephemeral=True
+    )
+
 
 @bot.tree.command(
     name='backfillstats',
