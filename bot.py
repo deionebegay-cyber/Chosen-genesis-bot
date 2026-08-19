@@ -197,6 +197,100 @@ async def refresh_leaderboard(guild):
         if msg.author.id==bot.user.id and msg.embeds and msg.embeds[0].title=='🏆 Chosen Genesis Leaderboard': await msg.edit(embed=e); return
     await ch.send(embed=e)
 
+
+PERIOD_CHOICES = [
+    app_commands.Choice(name='Today', value='today'),
+    app_commands.Choice(name='This Week', value='week'),
+    app_commands.Choice(name='This Month', value='month'),
+    app_commands.Choice(name='All Time', value='all'),
+]
+
+def subtract_stat(g,u,field,n):
+    allowed={'sales','appointments','pitches','hours','closer_sales','bills','within_48','same_day'}
+    if field not in allowed: return
+    c=con()
+    c.execute('INSERT OR IGNORE INTO stats(guild_id,user_id) VALUES(?,?)',(g,u))
+    c.execute(f'UPDATE stats SET {field}=MAX(0,{field}-?) WHERE guild_id=? AND user_id=?',(n,g,u))
+    c.commit(); c.close()
+
+async def recalc_after_event_change(guild):
+    await restore_daily(guild)
+    await refresh_streaks(guild)
+    await refresh_leaderboard(guild)
+
+def period_bounds(period):
+    local_now=now()
+    today=local_now.date()
+    if period=='today':
+        return today.isoformat(), today.isoformat(), 'Today'
+    if period=='week':
+        start=today-timedelta(days=today.weekday())
+        return start.isoformat(), today.isoformat(), 'This Week'
+    if period=='month':
+        start=today.replace(day=1)
+        return start.isoformat(), today.isoformat(), local_now.strftime('%B')
+    return None,None,'All Time'
+
+def period_rows(guild_id,period,kind):
+    start,end,_=period_bounds(period)
+    c=con()
+    if period=='all':
+        field={'appointments':'appointments','setter_sales':'sales','closer_sales':'closer_sales'}[kind]
+        rows=c.execute(
+            f'SELECT user_id,{field} value FROM stats WHERE guild_id=? AND {field}>0 ORDER BY {field} DESC LIMIT 10',
+            (guild_id,)
+        ).fetchall()
+    elif kind=='appointments':
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
+            'GROUP BY setter_id ORDER BY value DESC LIMIT 10',
+            (guild_id,start,end)
+        ).fetchall()
+    elif kind=='setter_sales':
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM sale_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
+            'GROUP BY setter_id ORDER BY value DESC LIMIT 10',
+            (guild_id,start,end)
+        ).fetchall()
+    else:
+        rows=c.execute(
+            'SELECT closer_id user_id,COUNT(*) value FROM sale_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
+            'GROUP BY closer_id ORDER BY value DESC LIMIT 10',
+            (guild_id,start,end)
+        ).fetchall()
+    c.close()
+    return rows
+
+async def show_period_leaderboard(guild,period='all'):
+    ch=await channel(guild,'leaderboard')
+    if not ch: return False
+    _,_,label=period_bounds(period)
+    a=period_rows(guild.id,period,'appointments')
+    s=period_rows(guild.id,period,'setter_sales')
+    cl=period_rows(guild.id,period,'closer_sales')
+
+    def fmt(rs):
+        medals=['🥇','🥈','🥉']; out=[]
+        for i,r in enumerate(rs):
+            m=guild.get_member(r['user_id'])
+            name=m.display_name if m else f"<@{r['user_id']}>"
+            prefix=medals[i] if i<3 else f"{i+1}."
+            out.append(f"{prefix} {name} — **{r['value']}**")
+        return '\n'.join(out) or 'No stats yet.'
+
+    e=discord.Embed(
+        title=f'🏆 Chosen Genesis Leaderboard — {label}',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='📅 Appointments',value=fmt(a),inline=False)
+    e.add_field(name='💰 Setter Sales',value=fmt(s),inline=False)
+    e.add_field(name='🤝 Closer Sales',value=fmt(cl),inline=False)
+    await ch.send(embed=e)
+    return True
+
 class Genesis(commands.Bot):
     async def setup_hook(self):
         setup_db(); maintenance.start()
@@ -267,9 +361,19 @@ async def kpi(interaction:discord.Interaction,pitches:int,appointments:int,hours
     await interaction.response.send_message('KPIs logged ✅',ephemeral=True); ch=await channel(interaction.guild,'daily-kpis');
     if ch: await ch.send(embed=e)
 
-@bot.tree.command(name='leaderboard',description='Update the leaderboard')
-async def leaderboard(interaction:discord.Interaction):
-    await interaction.response.defer(ephemeral=True); await refresh_leaderboard(interaction.guild); await interaction.followup.send('Leaderboard updated ✅',ephemeral=True)
+@bot.tree.command(name='leaderboard',description='Show a leaderboard for a time period')
+@app_commands.describe(period='Today, this week, this month, or all time')
+@app_commands.choices(period=PERIOD_CHOICES)
+async def leaderboard(interaction:discord.Interaction,period:app_commands.Choice[str]|None=None):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    selected=period.value if period else 'all'
+    ok=await show_period_leaderboard(interaction.guild,selected)
+    if ok:
+        await interaction.followup.send('Leaderboard posted ✅',ephemeral=True)
+    else:
+        await interaction.followup.send('I could not find the **leaderboard** channel.',ephemeral=True)
 
 @bot.tree.command(name='stats',description="See a rep's stats")
 async def stats(interaction:discord.Interaction,member:discord.Member|None=None):
@@ -278,6 +382,99 @@ async def stats(interaction:discord.Interaction,member:discord.Member|None=None)
     a=r['appointments']; e=discord.Embed(title=f"📈 {member.display_name}'s Stats"); e.add_field(name='📅 Appointments',value=a); e.add_field(name='📄 Bills',value=f"{r['bills']} ({(r['bills']/a*100 if a else 0):.0f}%)"); e.add_field(name='⏰ Within 48h',value=f"{r['within_48']} ({(r['within_48']/a*100 if a else 0):.0f}%)"); e.add_field(name='💰 Setter Sales',value=r['sales']); e.add_field(name='🤝 Closer Sales',value=r['closer_sales']); e.add_field(name='🗣️ Pitches',value=r['pitches']); e.add_field(name='⏱️ Hours',value=f"{r['hours']:g}")
     await interaction.response.send_message(embed=e)
 
+
+
+UNDO_CHOICES = [
+    app_commands.Choice(name='Appointment', value='appointment'),
+    app_commands.Choice(name='Sale', value='sale'),
+]
+
+@bot.tree.command(name='undo',description='Manager-only: undo an accidental appointment or sale log')
+@app_commands.describe(
+    log_type='What type of log should be undone?',
+    member='Optional: undo the latest log involving this member'
+)
+@app_commands.choices(log_type=UNDO_CHOICES)
+async def undo(
+    interaction: discord.Interaction,
+    log_type: app_commands.Choice[str],
+    member: discord.Member|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can undo logs.',
+            ephemeral=True
+        )
+
+    g=interaction.guild.id
+    c=con()
+
+    if log_type.value=='appointment':
+        if member:
+            row=c.execute(
+                'SELECT * FROM appointment_events WHERE guild_id=? AND setter_id=? ORDER BY id DESC LIMIT 1',
+                (g,member.id)
+            ).fetchone()
+        else:
+            row=c.execute(
+                'SELECT * FROM appointment_events WHERE guild_id=? ORDER BY id DESC LIMIT 1',
+                (g,)
+            ).fetchone()
+
+        if not row:
+            c.close()
+            return await interaction.response.send_message('No appointment log found to undo.',ephemeral=True)
+
+        c.execute('DELETE FROM appointment_events WHERE id=?',(row['id'],))
+        c.commit(); c.close()
+
+        subtract_stat(g,row['setter_id'],'appointments',1)
+        if row['bill_collected']: subtract_stat(g,row['setter_id'],'bills',1)
+        if row['within_48']: subtract_stat(g,row['setter_id'],'within_48',1)
+        if row['same_day']: subtract_stat(g,row['setter_id'],'same_day',1)
+
+        target=interaction.guild.get_member(row['setter_id'])
+        target_text=target.mention if target else '<@%s>' % row['setter_id']
+        await recalc_after_event_change(interaction.guild)
+        return await interaction.response.send_message(
+            f'✅ Undid the latest appointment for {target_text}.',
+            ephemeral=True
+        )
+
+    if member:
+        row=c.execute(
+            'SELECT * FROM sale_events WHERE guild_id=? AND (setter_id=? OR closer_id=?) ORDER BY id DESC LIMIT 1',
+            (g,member.id,member.id)
+        ).fetchone()
+    else:
+        row=c.execute(
+            'SELECT * FROM sale_events WHERE guild_id=? ORDER BY id DESC LIMIT 1',
+            (g,)
+        ).fetchone()
+
+    if not row:
+        c.close()
+        return await interaction.response.send_message('No sale log found to undo.',ephemeral=True)
+
+    c.execute('DELETE FROM sale_events WHERE id=?',(row['id'],))
+    c.commit(); c.close()
+
+    subtract_stat(g,row['setter_id'],'sales',1)
+    subtract_stat(g,row['closer_id'],'closer_sales',1)
+
+    setter=interaction.guild.get_member(row['setter_id'])
+    closer=interaction.guild.get_member(row['closer_id'])
+    setter_text=setter.mention if setter else '<@%s>' % row['setter_id']
+    closer_text=closer.mention if closer else '<@%s>' % row['closer_id']
+
+    await recalc_after_event_change(interaction.guild)
+    return await interaction.response.send_message(
+        f'✅ Undid the latest sale: setter {setter_text}, closer {closer_text}.',
+        ephemeral=True
+    )
 
 STAT_CHOICES = [
     app_commands.Choice(name='Appointments', value='appointments'),
@@ -296,7 +493,7 @@ ACTION_CHOICES = [
     app_commands.Choice(name='✏️ Set', value='set'),
 ]
 
-@bot.tree.command(name='editstats',description='Manager-only stat correction')
+@bot.tree.command(name='editstats',description='Manager-only: add, remove, or set saved totals')
 @app_commands.describe(
     member='Member whose stats you want to change',
     stat='Which stat to change',
