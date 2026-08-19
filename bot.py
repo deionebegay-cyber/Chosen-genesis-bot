@@ -319,7 +319,7 @@ async def refresh_leaderboard(guild):
         for i,r in enumerate(rs):
             m=guild.get_member(r['user_id'])
             name=m.display_name if m else f"<@{r['user_id']}>"
-            prefix=medals[i] if i<3 else f"{i+1}."
+            prefix=medals[i] if i<3 else f"#{i+1}"
             out.append(f"{prefix} {name} — **{r['value']}**")
         return '\n'.join(out) or 'No stats yet.'
 
@@ -474,7 +474,7 @@ async def show_period_leaderboard(guild,period='all'):
         for i,r in enumerate(rs):
             m=guild.get_member(r['user_id'])
             name=m.display_name if m else f"<@{r['user_id']}>"
-            prefix=medals[i] if i<3 else f"{i+1}."
+            prefix=medals[i] if i<3 else f"#{i+1}"
             out.append(f"{prefix} {name} — **{r['value']}**")
         return '\n'.join(out) or 'No stats yet.'
 
@@ -1117,6 +1117,8 @@ async def backfillsales(
             ephemeral=True
         )
 
+    await interaction.response.defer(ephemeral=True)
+
     g=interaction.guild.id
     date_text=edit_date.isoformat()
 
@@ -1149,7 +1151,7 @@ async def backfillsales(
     await refresh_leaderboard(interaction.guild)
 
     goal_text='Yes' if count_team_goal else 'No'
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f'✅ Safely added **{amount} historical sale(s)** on **{date_text}**.\n'
         + '\n'.join(credited)
         + f'\nTeam 30-sale goal: **{goal_text}**\n\n'
@@ -1206,6 +1208,8 @@ async def backfillstats(
             ephemeral=True
         )
 
+    await interaction.response.defer(ephemeral=True)
+
     field=stat.value
     if field != 'hours':
         amount=int(round(amount))
@@ -1232,7 +1236,7 @@ async def backfillstats(
         'closer_sales':'Closer Sales',
     }
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Backfilled **{amount:g} {labels[field]}** for {member.mention} on "
         f"**{edit_date.isoformat()}**. Their saved all-time total was not changed.",
         ephemeral=True
@@ -1274,6 +1278,8 @@ async def editstats(
     if field not in allowed:
         return await interaction.response.send_message('Invalid stat.',ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
+
     c=con(); c.execute('INSERT OR IGNORE INTO stats(guild_id,user_id) VALUES(?,?)',(interaction.guild.id,member.id))
     r=c.execute(f'SELECT {field} value FROM stats WHERE guild_id=? AND user_id=?',(interaction.guild.id,member.id)).fetchone()
     current=float(r['value']) if r else 0.0
@@ -1293,7 +1299,7 @@ async def editstats(
     await refresh_leaderboard(interaction.guild)
 
     labels={'appointments':'Appointments','bills':'Bills','within_48':'Within 48 Hours','same_day':'Same Day','sales':'Setter Sales','closer_sales':'Closer Sales','pitches':'Pitches','hours':'Hours'}
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ {member.mention}'s **{labels[field]}** is now **{new_value:g}**. The {delta:+g} correction counts on **{edit_date.isoformat()}**.",
         ephemeral=True
     )
