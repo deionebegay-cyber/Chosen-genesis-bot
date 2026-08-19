@@ -1081,7 +1081,6 @@ BACKFILL_STAT_CHOICES = [
     closer='Optional team closer to credit',
     outside_team='Turn on only if the closer was outside your team',
     count_team_goal='Should these sales add to the 30-sale team goal?',
-    custom_date='Only use with Custom Date, format YYYY-MM-DD'
 )
 async def backfillsales(
     interaction:discord.Interaction,
