@@ -1,4 +1,4 @@
-import os, sqlite3
+import os, sqlite3, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import discord
@@ -30,6 +30,28 @@ BADGE_DESCRIPTIONS = {
     '👑 Setter King':'Most appointments for the week.',
     '👑 Closer King':'Most closer sales for the week.'
 }
+
+APPOINTMENT_ANNOUNCEMENTS = [
+    ("📅 APPOINTMENT ON THE BOARD", "Another opportunity created. Keep stacking."),
+    ("🚪 DOORS → OPPORTUNITIES", "Another one added to the calendar."),
+    ("🔥 KEEP STACKING", "Chosen Genesis adds another appointment."),
+    ("🎯 TARGET ACQUIRED", "Another appointment is officially on the board."),
+    ("⚡ MOMENTUM", "Another opportunity created for the team."),
+    ("📈 BOARD MOVING", "The appointment count keeps climbing."),
+]
+
+SALE_ANNOUNCEMENTS = [
+    ("🚨 NEW SALE", "**CHOSEN GENESIS +1** 🔥"),
+    ("💰 BAG SECURED", "Another one closed for Chosen Genesis."),
+    ("☀️ ANOTHER ONE DOWN", "Chosen Genesis keeps rolling. +1 sale."),
+    ("🔥 DEAL CLOSED", "Another one officially on the board."),
+    ("📈 BOARD MOVING", "Chosen Genesis adds another sale."),
+    ("⚡ CASHED IN", "Another opportunity turned into a deal."),
+]
+
+def pick_announcement(pool):
+    return random.choice(pool)
+
 
 intents=discord.Intents.default(); intents.members=True; intents.message_content=True
 
@@ -739,35 +761,85 @@ async def maintenance():
 async def before_maintenance(): await bot.wait_until_ready()
 
 @bot.tree.command(name='appointment',description='Log a new appointment')
-@app_commands.describe(setter='Who set it',bill_collected='Did you collect the electric bill?',within_48_hours='Is it within 48 hours?',same_day='Is it same day?')
-async def appointment(interaction:discord.Interaction,setter:discord.Member,bill_collected:bool,within_48_hours:bool,same_day:bool=False):
+@app_commands.describe(
+    setter='Who set it',
+    bill_collected='Did you collect the electric bill?',
+    within_48_hours='Is it within 48 hours?',
+    same_day='Is it same day?',
+    message='Optional custom message to add to the announcement'
+)
+async def appointment(
+    interaction:discord.Interaction,
+    setter:discord.Member,
+    bill_collected:bool,
+    within_48_hours:bool,
+    same_day:bool,
+    message:str|None=None
+):
     if not interaction.guild: return
     n=now(); g=interaction.guild.id
-    c=con(); c.execute('INSERT INTO appointment_events(guild_id,setter_id,bill_collected,within_48,same_day,local_date,week_key,created_at) VALUES(?,?,?,?,?,?,?,?)',(g,setter.id,int(bill_collected),int(within_48_hours),int(same_day),dkey(n.date()),wkey(n.date()),datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
+
+    c=con()
+    c.execute(
+        'INSERT INTO appointment_events(guild_id,setter_id,bill_collected,within_48,same_day,local_date,week_key,created_at) '
+        'VALUES(?,?,?,?,?,?,?,?)',
+        (g,setter.id,int(bill_collected),int(within_48_hours),int(same_day),dkey(n.date()),wkey(n.date()),datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
     add(g,setter.id,'appointments',1)
     if bill_collected: add(g,setter.id,'bills',1)
     if within_48_hours: add(g,setter.id,'within_48',1)
     if same_day: add(g,setter.id,'same_day',1)
-    e=discord.Embed(title='📅 NEW APPOINTMENT',timestamp=datetime.now(timezone.utc)); e.add_field(name='👤 Setter',value=setter.mention,inline=False); e.add_field(name='📄 Bill',value='✅ Collected' if bill_collected else '❌ No'); e.add_field(name='⏰ Within 48 Hours',value='✅ Yes' if within_48_hours else '❌ No'); e.add_field(name='⚡ Same Day',value='✅ Yes' if same_day else '❌ No')
-    await interaction.response.send_message('Appointment logged ✅',ephemeral=True); await main(interaction.guild,embed=e)
+
+    title,description=pick_announcement(APPOINTMENT_ANNOUNCEMENTS)
+
+    # Keep all team references explicitly as Chosen Genesis.
+    description=description.replace('Genesis','Chosen Genesis')
+    description=description.replace('Chosen Chosen Genesis','Chosen Genesis')
+
+    custom=''
+    if message and message.strip():
+        custom='\n\n'+message.strip()[:500]
+
+    e=discord.Embed(
+        title=title,
+        description=description+custom,
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='👤 Setter',value=setter.mention,inline=False)
+    e.add_field(name='📄 Bill',value='✅ Collected' if bill_collected else '❌ No')
+    e.add_field(name='⏰ Within 48 Hours',value='✅ Yes' if within_48_hours else '❌ No')
+    e.add_field(name='⚡ Same Day',value='✅ Yes' if same_day else '❌ No')
+
+    await interaction.response.send_message('Appointment logged ✅',ephemeral=True)
+    await main(interaction.guild,embed=e)
+
     if first_setter(g)==setter.id:
         award_badge_count(g,setter.id,'🩸 First Blood',dkey())
-        await set_holders(interaction.guild,'🩸 First Blood',[setter.id]); await main(interaction.guild,content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!')
-    await refresh_daily_comp(interaction.guild); await refresh_streaks(interaction.guild); await refresh_leaderboard(interaction.guild)
+        await set_holders(interaction.guild,'🩸 First Blood',[setter.id])
+        await main(interaction.guild,content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!')
+
+    await refresh_daily_comp(interaction.guild)
+    await refresh_streaks(interaction.guild)
+    await refresh_leaderboard(interaction.guild)
+
 
 @bot.tree.command(name='sale',description='Log a new sale')
 @app_commands.describe(
     setter='Setter on the deal',
     closer='Closer who closed it (leave blank for outside team)',
     outside_team='Turn on if the closer is from another team',
-    utility='APS, SRP, etc.'
+    utility='APS, SRP, etc.',
+    message='Optional message to post with the sale'
 )
 async def sale(
     interaction:discord.Interaction,
     setter:discord.Member,
     outside_team:bool=False,
     closer:discord.Member|None=None,
-    utility:str='Unknown'
+    utility:str='Unknown',
+    message:str|None=None
 ):
     if not interaction.guild: return
 
@@ -792,14 +864,15 @@ async def sale(
     if not outside_team:
         add(g,closer.id,'closer_sales',1)
 
-    e=discord.Embed(
-        title='🚨 NEW SALE',
-        description='**CHOSEN GENESIS +1** 🔥',
-        timestamp=datetime.now(timezone.utc)
-    )
+    title,description=pick_announcement(SALE_ANNOUNCEMENTS)
+    description=description.replace('Genesis','Chosen Genesis').replace('Chosen Chosen Genesis','Chosen Genesis')
+    e=discord.Embed(title=title,description=description,timestamp=datetime.now(timezone.utc))
     e.add_field(name='🔥 Setter',value=setter.mention)
     e.add_field(name='🤝 Closer',value='**Outside Team**' if outside_team else closer.mention)
     e.add_field(name='⚡ Utility',value=utility.upper())
+
+    if message and message.strip():
+        e.description=(e.description or '')+'\n\n'+message.strip()[:500]
 
     await interaction.response.send_message('Sale logged ✅',ephemeral=True)
     await main(interaction.guild,embed=e)
@@ -807,18 +880,25 @@ async def sale(
     # Outside-team closers never receive closer stats, streaks, or daily closer badges.
     if not outside_team:
         count=closer_sales_today(g,closer.id)
-        if count>=1: await add_role(interaction.guild,closer,'💥 Sale')
+
+        if count>=1:
+            await add_role(interaction.guild,closer,'💥 Sale')
         if count==1:
             award_badge_count(g,closer.id,'💥 Sale',dkey())
             await main(interaction.guild,content=f'💥 **SALE BADGE!** {closer.mention} got a sale today!')
-        if count>=2: await add_role(interaction.guild,closer,'🥈 2 Spot')
+
+        if count>=2:
+            await add_role(interaction.guild,closer,'🥈 2 Spot')
         if count==2:
             award_badge_count(g,closer.id,'🥈 2 Spot',dkey())
             await main(interaction.guild,content=f'🥈 **2 SPOT!** {closer.mention} has **2 sales today!**')
-        if count>=3: await add_role(interaction.guild,closer,'🎩 Hattrick')
+
+        if count>=3:
+            await add_role(interaction.guild,closer,'🎩 Hattrick')
         if count==3:
             award_badge_count(g,closer.id,'🎩 Hattrick',dkey())
             await main(interaction.guild,content=f'🎩 **HATTRICK!** {closer.mention} has **3 sales today!** 🔥')
+
         if n.hour>=19:
             await add_role(interaction.guild,closer,'👻 Ghost Hunter')
             if award_badge_count(g,closer.id,'👻 Ghost Hunter',dkey()):
@@ -826,6 +906,7 @@ async def sale(
 
     await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
+
 
 
 @bot.tree.command(name='goalcheck',description='Manager-only: check today\'s appointment goal count')
