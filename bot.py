@@ -314,10 +314,6 @@ async def refresh_leaderboard(guild):
     ch=await channel(guild,'leaderboard')
     if not ch: return
 
-    a=weekly_leaderboard_rows(guild.id,'appointments')
-    s=weekly_leaderboard_rows(guild.id,'setter_sales')
-    cl=weekly_leaderboard_rows(guild.id,'closer_sales')
-
     def fmt(rs):
         medals=['🥇','🥈','🥉']; out=[]
         for i,r in enumerate(rs):
@@ -327,14 +323,37 @@ async def refresh_leaderboard(guild):
             out.append(f"{prefix} {name} — **{r['value']}**")
         return '\n'.join(out) or 'No stats yet.'
 
+    async def upsert_board(meta_key,title,embed):
+        saved_id=meta_get(guild.id,meta_key)
+        if saved_id:
+            try:
+                msg=await ch.fetch_message(int(saved_id))
+                await msg.edit(embed=embed)
+                return
+            except (discord.NotFound,discord.Forbidden,discord.HTTPException,ValueError):
+                pass
+
+        async for msg in ch.history(limit=100):
+            if msg.author.id==bot.user.id and msg.embeds and msg.embeds[0].title==title:
+                await msg.edit(embed=embed)
+                meta_set(guild.id,meta_key,str(msg.id))
+                return
+
+        msg=await ch.send(embed=embed)
+        meta_set(guild.id,meta_key,str(msg.id))
+
+    # WEEKLY LIVE BOARD
+    a=period_rows(guild.id,'week','appointments')
+    s=period_rows(guild.id,'week','setter_sales')
+    cl=period_rows(guild.id,'week','closer_sales')
     daily_appts=team_daily_appointments(guild.id)
     monthly_sales=team_monthly_sales(guild.id)
 
     daily_bar=progress_bar(daily_appts,DAILY_APPOINTMENT_GOAL)
     monthly_bar=progress_bar(monthly_sales,MONTHLY_SALES_GOAL)
 
-    e=discord.Embed(
-        title='🏆 Chosen Genesis — Live Leaderboard',
+    weekly=discord.Embed(
+        title='🏆 Chosen Genesis — Weekly Leaderboard',
         description=(
             f'**🎯 TODAY: {daily_appts} / {DAILY_APPOINTMENT_GOAL} APPOINTMENTS**\n'
             f'`{daily_bar}` **{min(100,round(daily_appts/DAILY_APPOINTMENT_GOAL*100))}%**\n\n'
@@ -343,37 +362,51 @@ async def refresh_leaderboard(guild):
         ),
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name='📅 This Week — Appointments',value=fmt(a),inline=False)
-    e.add_field(name='💰 This Week — Setter Sales',value=fmt(s),inline=False)
-    e.add_field(name='🤝 This Week — Closer Sales',value=fmt(cl),inline=False)
-    e.add_field(name='🏅 Current Badges',value=current_badge_board(guild),inline=False)
-    e.set_footer(text='Updates automatically when stats change.')
+    weekly.add_field(name='📅 This Week — Appointments',value=fmt(a),inline=False)
+    weekly.add_field(name='💰 This Week — Setter Sales',value=fmt(s),inline=False)
+    weekly.add_field(name='🤝 This Week — Closer Sales',value=fmt(cl),inline=False)
+    weekly.add_field(name='🏅 Current Badges',value=current_badge_board(guild),inline=False)
+    weekly.set_footer(text='Updates automatically when stats change.')
 
-    # Keep ONE permanent leaderboard message and edit it forever.
-    saved_id=meta_get(guild.id,'live_leaderboard_message_id')
-    if saved_id:
-        try:
-            msg=await ch.fetch_message(int(saved_id))
-            await msg.edit(embed=e)
-            return
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
-            pass
+    # MONTHLY BOARD
+    ma=period_rows(guild.id,'month','appointments')
+    ms=period_rows(guild.id,'month','setter_sales')
+    mcl=period_rows(guild.id,'month','closer_sales')
+    month_label=now().strftime('%B %Y')
+    monthly=discord.Embed(
+        title='📆 Chosen Genesis — Monthly Leaderboard',
+        description=f'**{month_label}**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    monthly.add_field(name='📅 Appointments',value=fmt(ma),inline=False)
+    monthly.add_field(name='💰 Setter Sales',value=fmt(ms),inline=False)
+    monthly.add_field(name='🤝 Closer Sales',value=fmt(mcl),inline=False)
+    monthly.set_footer(text='Updates automatically when stats change.')
 
-    # Recover an existing live leaderboard message if the ID was lost.
-    async for msg in ch.history(limit=50):
-        if msg.author.id==bot.user.id and msg.embeds and msg.embeds[0].title=='🏆 Chosen Genesis — Live Leaderboard':
-            await msg.edit(embed=e)
-            meta_set(guild.id,'live_leaderboard_message_id',str(msg.id))
-            return
+    # YEARLY BOARD
+    ya=period_rows(guild.id,'year','appointments')
+    ys=period_rows(guild.id,'year','setter_sales')
+    ycl=period_rows(guild.id,'year','closer_sales')
+    yearly=discord.Embed(
+        title='🏆 Chosen Genesis — Yearly Leaderboard',
+        description=f'**{now().year}**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    yearly.add_field(name='📅 Appointments',value=fmt(ya),inline=False)
+    yearly.add_field(name='💰 Setter Sales',value=fmt(ys),inline=False)
+    yearly.add_field(name='🤝 Closer Sales',value=fmt(ycl),inline=False)
+    yearly.set_footer(text='Updates automatically when stats change.')
 
-    msg=await ch.send(embed=e)
-    meta_set(guild.id,'live_leaderboard_message_id',str(msg.id))
+    await upsert_board('weekly_leaderboard_message_id','🏆 Chosen Genesis — Weekly Leaderboard',weekly)
+    await upsert_board('monthly_leaderboard_message_id','📆 Chosen Genesis — Monthly Leaderboard',monthly)
+    await upsert_board('yearly_leaderboard_message_id','🏆 Chosen Genesis — Yearly Leaderboard',yearly)
 
 
 PERIOD_CHOICES = [
     app_commands.Choice(name='Today', value='today'),
     app_commands.Choice(name='This Week', value='week'),
     app_commands.Choice(name='This Month', value='month'),
+    app_commands.Choice(name='This Year', value='year'),
     app_commands.Choice(name='All Time', value='all'),
 ]
 
@@ -401,6 +434,9 @@ def period_bounds(period):
     if period=='month':
         start=today.replace(day=1)
         return start.isoformat(), today.isoformat(), local_now.strftime('%B')
+    if period=='year':
+        start=today.replace(month=1,day=1)
+        return start.isoformat(), today.isoformat(), str(today.year)
     return None,None,'All Time'
 
 def period_rows(guild_id,period,kind):
@@ -502,6 +538,10 @@ def current_week_bounds():
 def current_month_bounds():
     today=now().date()
     return today.replace(day=1).isoformat(),today.isoformat()
+
+def current_year_bounds():
+    today=now().date()
+    return today.replace(month=1,day=1).isoformat(),today.isoformat()
 
 def weekly_rank(guild_id,user_id,stat):
     start,end=current_week_bounds()
@@ -705,13 +745,13 @@ async def goalcheck(interaction:discord.Interaction):
     )
 
 
-@bot.tree.command(name='leaderboard',description='Refresh the permanent live leaderboard')
+@bot.tree.command(name='leaderboard',description='Refresh weekly, monthly, and yearly leaderboards')
 async def leaderboard(interaction:discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await refresh_leaderboard(interaction.guild)
-    await interaction.followup.send('Live leaderboard refreshed ✅',ephemeral=True)
+    await interaction.followup.send('Weekly, monthly, and yearly leaderboards refreshed ✅',ephemeral=True)
 
 
 @bot.tree.command(name='mystats',description='View your private performance dashboard')
@@ -722,7 +762,9 @@ async def mystats(interaction:discord.Interaction):
     member=interaction.user
     start,end=current_week_bounds()
     mstart,mend=current_month_bounds()
+    ystart,yend=current_year_bounds()
 
+    # This week
     appts=period_total_for_user(interaction.guild.id,member.id,'appointments',start,end)
     bills=period_total_for_user(interaction.guild.id,member.id,'bills',start,end)
     within48=period_total_for_user(interaction.guild.id,member.id,'within_48',start,end)
@@ -730,9 +772,15 @@ async def mystats(interaction:discord.Interaction):
     setter_sales=period_total_for_user(interaction.guild.id,member.id,'sales',start,end)
     closer_sales=period_total_for_user(interaction.guild.id,member.id,'closer_sales',start,end)
 
+    # This month
     month_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',mstart,mend)
     month_setter_sales=period_total_for_user(interaction.guild.id,member.id,'sales',mstart,mend)
     month_closer_sales=period_total_for_user(interaction.guild.id,member.id,'closer_sales',mstart,mend)
+
+    # This year
+    year_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',ystart,yend)
+    year_setter_sales=period_total_for_user(interaction.guild.id,member.id,'sales',ystart,yend)
+    year_closer_sales=period_total_for_user(interaction.guild.id,member.id,'closer_sales',ystart,yend)
 
     bill_rate=(bills/appts*100) if appts else 0
     within_rate=(within48/appts*100) if appts else 0
@@ -760,18 +808,33 @@ async def mystats(interaction:discord.Interaction):
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(
-        name='📅 Appointment Quality',
+        name='📅 This Week',
         value=(
             f'Appointments: **{appts}**\n'
             f'📄 Bills: **{bills}** ({bill_rate:.0f}%)\n'
             f'⏰ Within 48h: **{within48}** ({within_rate:.0f}%)\n'
-            f'⚡ Same Day: **{same_day}** ({same_day_rate:.0f}%)'
+            f'⚡ Same Day: **{same_day}** ({same_day_rate:.0f}%)\n'
+            f'💰 Setter Sales: **{setter_sales}**\n'
+            f'🤝 Closer Sales: **{closer_sales}**'
         ),
         inline=False
     )
     e.add_field(
-        name='💰 Sales',
-        value=f'Setter Sales: **{setter_sales}**\nCloser Sales: **{closer_sales}**',
+        name='📆 This Month',
+        value=(
+            f'Appointments: **{month_appts}**\n'
+            f'Setter Sales: **{month_setter_sales}**\n'
+            f'Closer Sales: **{month_closer_sales}**'
+        ),
+        inline=True
+    )
+    e.add_field(
+        name=f'🗓️ {now().year}',
+        value=(
+            f'Appointments: **{year_appts}**\n'
+            f'Setter Sales: **{year_setter_sales}**\n'
+            f'Closer Sales: **{year_closer_sales}**'
+        ),
         inline=True
     )
     e.add_field(
@@ -783,20 +846,11 @@ async def mystats(interaction:discord.Interaction):
         ) + (
             f'Closer Sales: **#{closer_rank}**' if closer_rank else 'Closer Sales: **Unranked**'
         ),
-        inline=True
+        inline=False
     )
     e.add_field(
         name='🏅 Current Badges',
         value='\n'.join(badges) if badges else 'No current badges',
-        inline=False
-    )
-    e.add_field(
-        name='📆 This Month',
-        value=(
-            f'Appointments: **{month_appts}**\n'
-            f'Setter Sales: **{month_setter_sales}**\n'
-            f'Closer Sales: **{month_closer_sales}**'
-        ),
         inline=False
     )
     e.set_footer(text='Only you can see this dashboard.')
@@ -967,21 +1021,23 @@ BACKFILL_STAT_CHOICES = [
     description='Manager-only: safely add historical sales without daily badges'
 )
 @app_commands.describe(
-    setter='Setter who received credit',
     amount='Number of historical sales to add',
     date='Today, yesterday, or custom date',
+    setter='Optional setter to credit',
     closer='Optional team closer to credit',
-    outside_team='Turn on if the closer was outside your team',
+    outside_team='Turn on only if the closer was outside your team',
+    count_team_goal='Should these sales add to the 30-sale team goal?',
     custom_date='Only use with Custom Date, format YYYY-MM-DD'
 )
 @app_commands.choices(date=DATE_CHOICES)
 async def backfillsales(
     interaction:discord.Interaction,
-    setter:discord.Member,
     amount:int,
     date:app_commands.Choice[str],
-    outside_team:bool=False,
+    setter:discord.Member|None=None,
     closer:discord.Member|None=None,
+    outside_team:bool=False,
+    count_team_goal:bool=True,
     custom_date:str|None=None
 ):
     if not interaction.guild:
@@ -993,9 +1049,16 @@ async def backfillsales(
         )
     if amount<=0:
         return await interaction.response.send_message('Amount must be greater than 0.',ephemeral=True)
-    if not outside_team and closer is None:
+
+    if setter is None and closer is None and not outside_team:
         return await interaction.response.send_message(
-            '❌ Choose the team closer, or turn **Outside Team** on.',
+            '❌ Choose at least a **setter** or **closer** to credit.',
+            ephemeral=True
+        )
+
+    if outside_team and closer is not None:
+        return await interaction.response.send_message(
+            '❌ If **Outside Team** is on, leave the closer blank.',
             ephemeral=True
         )
 
@@ -1009,31 +1072,40 @@ async def backfillsales(
     g=interaction.guild.id
     date_text=edit_date.isoformat()
 
-    # Personal totals + dated leaderboard history.
-    add(g,setter.id,'sales',amount)
-    record_adjustment(g,setter.id,'sales',amount,date_text)
+    credited=[]
 
-    closer_text='Outside Team'
-    if not outside_team:
+    # Credit setter only if one was supplied.
+    if setter is not None:
+        add(g,setter.id,'sales',amount)
+        record_adjustment(g,setter.id,'sales',amount,date_text)
+        credited.append(f'Setter: {setter.mention}')
+
+    # Credit closer only if they are actually on this team.
+    if closer is not None and not outside_team:
         add(g,closer.id,'closer_sales',amount)
         record_adjustment(g,closer.id,'closer_sales',amount,date_text)
-        closer_text=closer.mention
+        credited.append(f'Closer: {closer.mention}')
+    elif outside_team:
+        credited.append('Closer: **Outside Team**')
 
-    # Count these deals toward the 30-sale team goal without creating sale_events.
-    # Because no sale_event is created, this command NEVER awards Sale/2 Spot/Hattrick/Ghost Hunter.
-    c=con()
-    c.execute(
-        'INSERT INTO team_sale_adjustments(guild_id,amount,local_date,created_at) VALUES(?,?,?,?)',
-        (g,amount,date_text,datetime.now(timezone.utc).isoformat())
-    )
-    c.commit(); c.close()
+    # Team goal is optional. This prevents double-counting when you are
+    # only correcting a closer number for a sale that was already counted.
+    if count_team_goal:
+        c=con()
+        c.execute(
+            'INSERT INTO team_sale_adjustments(guild_id,amount,local_date,created_at) VALUES(?,?,?,?)',
+            (g,amount,date_text,datetime.now(timezone.utc).isoformat())
+        )
+        c.commit(); c.close()
 
     await refresh_leaderboard(interaction.guild)
 
+    goal_text='Yes' if count_team_goal else 'No'
     await interaction.response.send_message(
         f'✅ Safely added **{amount} historical sale(s)** on **{date_text}**.\n'
-        f'Setter: {setter.mention}\nCloser: {closer_text}\n\n'
-        f'No Sale, 2 Spot, Hattrick, or Ghost Hunter badges were triggered.',
+        + '\n'.join(credited)
+        + f'\nTeam 30-sale goal: **{goal_text}**\n\n'
+        + 'No Sale, 2 Spot, Hattrick, or Ghost Hunter badges were triggered.',
         ephemeral=True
     )
 
