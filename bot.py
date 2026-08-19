@@ -84,6 +84,13 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id INTEGER,user_id INTEGER,badge_name TEXT,award_key TEXT,created_at TEXT,
       UNIQUE(guild_id,user_id,badge_name,award_key));
+    CREATE TABLE IF NOT EXISTS personal_records(
+      guild_id INTEGER,user_id INTEGER,record_name TEXT,best_value INTEGER DEFAULT 0,
+      PRIMARY KEY(guild_id,user_id,record_name));
+    CREATE TABLE IF NOT EXISTS record_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,record_name TEXT,value INTEGER,
+      local_date TEXT,week_key TEXT,created_at TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -185,7 +192,8 @@ async def finalize_night_owl(guild,date_obj):
     uid=last_setter_for_date(guild.id,date_text)
     if not uid: return
     # Historical count is permanent. The role itself represents the latest finalized day.
-    award_badge_count(guild.id,uid,'🦉 Night Owl',date_text)
+    if award_badge_count(guild.id,uid,'🦉 Night Owl',date_text):
+        await announce_badge_milestone(guild,uid,'🦉 Night Owl')
     member=guild.get_member(uid)
     if member:
         await set_holders(guild,'🦉 Night Owl',[uid])
@@ -197,6 +205,247 @@ async def finalize_previous_day_badges(guild):
         return
     await finalize_night_owl(guild,yesterday)
     meta_set(guild.id,key,yesterday.isoformat())
+
+
+
+BADGE_MILESTONES = {5,10,25,50,100}
+
+def badge_count_for(g,u,badge_name):
+    c=con()
+    r=c.execute(
+        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? AND user_id=? AND badge_name=?',
+        (g,u,badge_name)
+    ).fetchone()
+    c.close()
+    return int(r['c'] or 0)
+
+async def announce_badge_milestone(guild,user_id,badge_name):
+    count=badge_count_for(guild.id,user_id,badge_name)
+    if count not in BADGE_MILESTONES:
+        return
+    member=guild.get_member(user_id)
+    if not member:
+        return
+    await main(
+        guild,
+        content=f'🏅 **BADGE MILESTONE!** {member.mention} just earned **{badge_name}** for the **{count}th time!**'
+    )
+
+def get_personal_best(g,u,record_name):
+    c=con()
+    r=c.execute(
+        'SELECT best_value FROM personal_records WHERE guild_id=? AND user_id=? AND record_name=?',
+        (g,u,record_name)
+    ).fetchone()
+    c.close()
+    return int(r['best_value']) if r else 0
+
+def set_personal_best(g,u,record_name,value):
+    c=con()
+    c.execute(
+        'INSERT INTO personal_records(guild_id,user_id,record_name,best_value) VALUES(?,?,?,?) '
+        'ON CONFLICT(guild_id,user_id,record_name) DO UPDATE SET best_value=excluded.best_value',
+        (g,u,record_name,int(value))
+    )
+    c.commit(); c.close()
+
+def log_record_event(g,u,record_name,value,date_text):
+    try:
+        d=datetime.strptime(date_text,'%Y-%m-%d').date()
+    except ValueError:
+        d=now().date()
+        date_text=d.isoformat()
+    c=con()
+    c.execute(
+        'INSERT INTO record_events(guild_id,user_id,record_name,value,local_date,week_key,created_at) VALUES(?,?,?,?,?,?,?)',
+        (g,u,record_name,int(value),date_text,wkey(d),datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
+async def check_daily_personal_best(guild,user_id,record_name,current_value,label,emoji):
+    old=get_personal_best(guild.id,user_id,record_name)
+
+    # Initialize silently the first time so the bot does not call a person's
+    # very first single appointment/sale a "personal best".
+    # Don't establish or announce appointment personal bests until the rep
+    # reaches at least 3 appointments in a day. This prevents 1-2 appointments
+    # from becoming a misleading "personal best" for reps with incomplete history.
+    if record_name=='daily_appointments' and current_value<=2:
+        return
+
+    if old==0:
+        set_personal_best(guild.id,user_id,record_name,current_value)
+        return
+
+    if current_value<=old:
+        return
+
+    set_personal_best(guild.id,user_id,record_name,current_value)
+    log_record_event(guild.id,user_id,record_name,current_value,dkey())
+    member=guild.get_member(user_id)
+    if member:
+        await main(
+            guild,
+            content=f'{emoji} **NEW PERSONAL BEST!** {member.mention} just hit **{current_value} {label} in one day!** Previous best: **{old}**.'
+        )
+
+def setter_sales_today(g,u):
+    today=dkey()
+    c=con()
+    n=c.execute(
+        'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND setter_id=? AND local_date=?',
+        (g,u,today)
+    ).fetchone()['c']
+    a=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=? AND local_date=?',
+        (g,u,'sales',today)
+    ).fetchone()['v']
+    c.close()
+    return max(0,int(n+(a or 0)))
+
+def appointments_today_for_user(g,u):
+    return period_total_for_user(g,u,'appointments',dkey(),dkey())
+
+def has_any_sale_credit(g,u,kind):
+    c=con()
+    if kind=='setter':
+        r=c.execute('SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND setter_id=?',(g,u)).fetchone()
+        a=c.execute('SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=?',(g,u,'sales')).fetchone()
+    else:
+        r=c.execute('SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND closer_id=?',(g,u)).fetchone()
+        a=c.execute('SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=?',(g,u,'closer_sales')).fetchone()
+    c.close()
+    return int((r['c'] or 0)+(a['v'] or 0))
+
+async def check_first_sale(guild,user_id,kind):
+    # Only announce when total credited sales reaches exactly 1.
+    total=has_any_sale_credit(guild.id,user_id,kind)
+    if total!=1:
+        return
+    key=f'first_sale_{kind}_{user_id}'
+    if meta_get(guild.id,key):
+        return
+    meta_set(guild.id,key,'1')
+    member=guild.get_member(user_id)
+    if not member:
+        return
+    if kind=='setter':
+        await main(guild,content=f'💰 **FIRST SALE!** {member.mention} just got their first setter sale for **Chosen Genesis**! 🔥')
+    else:
+        await main(guild,content=f'🤝 **FIRST CLOSE!** {member.mention} just got their first closer sale for **Chosen Genesis**! 🔥')
+
+def week_date_bounds_from_key(week_key):
+    year=int(week_key[:4]); week=int(week_key[-2:])
+    start=date.fromisocalendar(year,week,1)
+    end=date.fromisocalendar(year,week,7)
+    return start.isoformat(),end.isoformat()
+
+def team_week_total(g,week_key,kind):
+    start,end=week_date_bounds_from_key(week_key)
+    c=con()
+    if kind=='appointments':
+        base=c.execute(
+            'SELECT COUNT(*) c FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['c']
+        adj=c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
+            (g,'appointments',start,end)
+        ).fetchone()['v']
+    else:
+        base=c.execute(
+            'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['c']
+        adj=c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM team_sale_adjustments WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['v']
+    c.close()
+    return max(0,int((base or 0)+(adj or 0)))
+
+def week_metric_winners(g,week_key,metric):
+    start,end=week_date_bounds_from_key(week_key)
+    c=con(); totals={}
+    if metric=='bills':
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(bill_collected),0) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',
+            (g,start,end)
+        ).fetchall()
+        stat='bills'
+    elif metric=='same_day':
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(same_day),0) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',
+            (g,start,end)
+        ).fetchall()
+        stat='same_day'
+    else:
+        c.close(); return [],0
+    for r in rows:
+        totals[r['user_id']]=float(r['value'] or 0)
+    adj=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
+        'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ? GROUP BY user_id',
+        (g,stat,start,end)
+    ).fetchall()
+    c.close()
+    for r in adj:
+        totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+    totals={u:v for u,v in totals.items() if v>0}
+    if not totals:
+        return [],0
+    best=max(totals.values())
+    return [u for u,v in totals.items() if v==best],int(best)
+
+async def weekly_recap(guild,week_key):
+    if meta_get(guild.id,'weekly_recap_posted')==week_key:
+        return
+
+    appts=team_week_total(guild.id,week_key,'appointments')
+    sales=team_week_total(guild.id,week_key,'sales')
+    setters,setter_count=week_winners(guild.id,week_key,'setter')
+    closers,closer_count=week_winners(guild.id,week_key,'closer')
+    bill_winners,bill_count=week_metric_winners(guild.id,week_key,'bills')
+    sd_winners,sd_count=week_metric_winners(guild.id,week_key,'same_day')
+
+    c=con()
+    badge_count=c.execute(
+        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? AND award_key=?',
+        (guild.id,week_key)
+    ).fetchone()['c']
+    # Daily badge award keys are dates, so also count awards whose dates fall inside the week.
+    start,end=week_date_bounds_from_key(week_key)
+    badge_daily=c.execute(
+        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? AND award_key BETWEEN ? AND ?',
+        (guild.id,start,end)
+    ).fetchone()['c']
+    pb_count=c.execute(
+        'SELECT COUNT(*) c FROM record_events WHERE guild_id=? AND week_key=?',
+        (guild.id,week_key)
+    ).fetchone()['c']
+    c.close()
+
+    def names(ids):
+        return ', '.join((guild.get_member(x).display_name if guild.get_member(x) else f'<@{x}>') for x in ids) or 'No winner'
+
+    e=discord.Embed(
+        title='🏆 CHOSEN GENESIS — WEEKLY RECAP',
+        description=f'**{week_key}**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='📅 Team Appointments',value=f'**{appts}**',inline=True)
+    e.add_field(name='💰 Team Sales',value=f'**{sales}**',inline=True)
+    e.add_field(name='🔥 Personal Bests',value=f'**{int(pb_count or 0)}** broken',inline=True)
+    e.add_field(name='👑 Setter King',value=f'**{names(setters)}** — {setter_count} appointments',inline=False)
+    e.add_field(name='👑 Closer King',value=f'**{names(closers)}** — {closer_count} sales',inline=False)
+    e.add_field(name='📄 Most Bills',value=f'**{names(bill_winners)}** — {bill_count}',inline=True)
+    e.add_field(name='⚡ Most Same Days',value=f'**{names(sd_winners)}** — {sd_count}',inline=True)
+    e.add_field(name='🏅 Badges Earned',value=f'**{int((badge_count or 0)+(badge_daily or 0))}**',inline=True)
+    e.set_footer(text='New week. Same mission.')
+    await main(guild,embed=e)
+    meta_set(guild.id,'weekly_recap_posted',week_key)
 
 
 def adjustment_sum(g,u,stat,start_date,end_date):
@@ -261,7 +510,8 @@ async def refresh_daily_comp(guild):
         leaders=daily_leaders(guild.id,metric)
         await set_holders(guild,badge,leaders)
         for uid in leaders:
-            award_badge_count(guild.id,uid,badge,dkey())
+            if award_badge_count(guild.id,uid,badge,dkey()):
+                await announce_badge_milestone(guild,uid,badge)
 
 def closer_sales_today(g,u):
     today=dkey(); c=con()
@@ -293,8 +543,12 @@ async def refresh_streaks(guild):
     ice=[u for u in closers if streak(guild.id,u,'sale_events','closer_id',3)]
     await set_holders(guild,'🔥 Hot Streak',hot)
     await set_holders(guild,'🧊 Ice Cold',ice)
-    for uid in hot: award_badge_count(guild.id,uid,'🔥 Hot Streak',dkey())
-    for uid in ice: award_badge_count(guild.id,uid,'🧊 Ice Cold',dkey())
+    for uid in hot:
+        if award_badge_count(guild.id,uid,'🔥 Hot Streak',dkey()):
+            await announce_badge_milestone(guild,uid,'🔥 Hot Streak')
+    for uid in ice:
+        if award_badge_count(guild.id,uid,'🧊 Ice Cold',dkey()):
+            await announce_badge_milestone(guild,uid,'🧊 Ice Cold')
 
 def week_winners(g,wk,kind):
     c=con(); totals={}
@@ -315,8 +569,12 @@ async def weekly_kings(guild):
     if meta_get(guild.id,'weekly_awarded')==wk: return
     s,sc=week_winners(guild.id,wk,'setter'); c,cc=week_winners(guild.id,wk,'closer')
     await set_holders(guild,'👑 Setter King',s); await set_holders(guild,'👑 Closer King',c)
-    for uid in s: award_badge_count(guild.id,uid,'👑 Setter King',wk)
-    for uid in c: award_badge_count(guild.id,uid,'👑 Closer King',wk)
+    for uid in s:
+        if award_badge_count(guild.id,uid,'👑 Setter King',wk):
+            await announce_badge_milestone(guild,uid,'👑 Setter King')
+    for uid in c:
+        if award_badge_count(guild.id,uid,'👑 Closer King',wk):
+            await announce_badge_milestone(guild,uid,'👑 Closer King')
     if s or c:
         e=discord.Embed(title='👑 WEEKLY KINGS')
         e.add_field(name='👑 Setter King',value=(", ".join(f'<@{x}>' for x in s)+f' — **{sc} appointments**') if s else 'No winner',inline=False)
@@ -750,7 +1008,11 @@ async def maintenance():
         await finalize_previous_day_badges(g)
         if meta_get(g.id,'daily_date')!=dkey():
             await clear_roles(g,DAILY); meta_set(g.id,'daily_date',dkey()); await restore_daily(g)
-        await refresh_streaks(g); await weekly_kings(g)
+        await refresh_streaks(g)
+        await weekly_kings(g)
+        if now().weekday()==0:
+            prev=now().date()-timedelta(days=1)
+            await weekly_recap(g,wkey(prev))
 
 @maintenance.before_loop
 async def before_maintenance(): await bot.wait_until_ready()
@@ -810,8 +1072,14 @@ async def appointment(
     await interaction.response.send_message('Appointment logged ✅',ephemeral=True)
     await main(interaction.guild,embed=e)
 
+    await check_daily_personal_best(
+        interaction.guild,setter.id,'daily_appointments',
+        appointments_today_for_user(g,setter.id),'appointments','📈'
+    )
+
     if first_setter(g)==setter.id:
-        award_badge_count(g,setter.id,'🩸 First Blood',dkey())
+        if award_badge_count(g,setter.id,'🩸 First Blood',dkey()):
+            await announce_badge_milestone(interaction.guild,setter.id,'🩸 First Blood')
         await set_holders(interaction.guild,'🩸 First Blood',[setter.id])
         await main(interaction.guild,content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!')
 
@@ -872,6 +1140,19 @@ async def sale(
     await interaction.response.send_message('Sale logged ✅',ephemeral=True)
     await main(interaction.guild,embed=e)
 
+    await check_first_sale(interaction.guild,setter.id,'setter')
+    await check_daily_personal_best(
+        interaction.guild,setter.id,'daily_setter_sales',
+        setter_sales_today(g,setter.id),'setter sales','💰'
+    )
+
+    if not outside_team:
+        await check_first_sale(interaction.guild,closer.id,'closer')
+        await check_daily_personal_best(
+            interaction.guild,closer.id,'daily_closer_sales',
+            closer_sales_today(g,closer.id),'closer sales','🤝'
+        )
+
     # Outside-team closers never receive closer stats, streaks, or daily closer badges.
     if not outside_team:
         count=closer_sales_today(g,closer.id)
@@ -879,123 +1160,33 @@ async def sale(
         if count>=1:
             await add_role(interaction.guild,closer,'💥 Sale')
         if count==1:
-            award_badge_count(g,closer.id,'💥 Sale',dkey())
+            if award_badge_count(g,closer.id,'💥 Sale',dkey()):
+                await announce_badge_milestone(interaction.guild,closer.id,'💥 Sale')
             await main(interaction.guild,content=f'💥 **SALE BADGE!** {closer.mention} got a sale today!')
 
         if count>=2:
             await add_role(interaction.guild,closer,'🥈 2 Spot')
         if count==2:
-            award_badge_count(g,closer.id,'🥈 2 Spot',dkey())
+            if award_badge_count(g,closer.id,'🥈 2 Spot',dkey()):
+                await announce_badge_milestone(interaction.guild,closer.id,'🥈 2 Spot')
             await main(interaction.guild,content=f'🥈 **2 SPOT!** {closer.mention} has **2 sales today!**')
 
         if count>=3:
             await add_role(interaction.guild,closer,'🎩 Hattrick')
         if count==3:
-            award_badge_count(g,closer.id,'🎩 Hattrick',dkey())
+            if award_badge_count(g,closer.id,'🎩 Hattrick',dkey()):
+                await announce_badge_milestone(interaction.guild,closer.id,'🎩 Hattrick')
             await main(interaction.guild,content=f'🎩 **HATTRICK!** {closer.mention} has **3 sales today!** 🔥')
 
         if n.hour>=19:
             await add_role(interaction.guild,closer,'👻 Ghost Hunter')
             if award_badge_count(g,closer.id,'👻 Ghost Hunter',dkey()):
+                await announce_badge_milestone(interaction.guild,closer.id,'👻 Ghost Hunter')
                 await main(interaction.guild,content=f'👻 **GHOST HUNTER!** {closer.mention} closed a deal after 7 PM!')
 
     await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
 
-
-
-@bot.tree.command(name='goalcheck',description='Manager-only: check today\'s appointment goal count')
-async def goalcheck(interaction:discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
-    if not is_manager(interaction.user):
-        return await interaction.response.send_message(
-            '❌ Only users with the **Manager** role can use this.',
-            ephemeral=True
-        )
-
-    today=dkey()
-    c=con()
-    rows=c.execute(
-        'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
-        'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
-        (interaction.guild.id,today)
-    ).fetchall()
-    adjustments=c.execute(
-        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
-        'WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',
-        (interaction.guild.id,'appointments',today)
-    ).fetchall()
-    c.close()
-
-    data={}
-    for r in rows:
-        data[r['user_id']]={'logs':float(r['value'] or 0),'adjustments':0}
-    for r in adjustments:
-        data.setdefault(r['user_id'],{'logs':0,'adjustments':0})
-        data[r['user_id']]['adjustments']=float(r['value'] or 0)
-
-    lines=[]
-    for uid,vals in data.items():
-        member=interaction.guild.get_member(uid)
-        name=member.display_name if member else f'<@{uid}>'
-        final=max(0,vals['logs']+vals['adjustments'])
-        lines.append(
-            f"{name}: logs **{vals['logs']:g}**, corrections **{vals['adjustments']:+g}**, counted **{final:g}**"
-        )
-
-    total=team_daily_appointments(interaction.guild.id)
-    text='\n'.join(lines) if lines else 'No appointment activity recorded today.'
-    await interaction.response.send_message(
-        f"**Today's goal count: {total}/{DAILY_APPOINTMENT_GOAL}**\n\n{text}",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name='reorderleaderboards',
-    description='Manager-only: put Weekly at the bottom so it is seen first'
-)
-async def reorderleaderboards(interaction:discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
-    if not is_manager(interaction.user):
-        return await interaction.response.send_message(
-            '❌ Only users with the **Manager** role can reorder leaderboards.',
-            ephemeral=True
-        )
-
-    ch=await channel(interaction.guild,'leaderboard')
-    if not ch:
-        return await interaction.response.send_message(
-            'I could not find the **leaderboard** channel.',
-            ephemeral=True
-        )
-
-    await interaction.response.defer(ephemeral=True)
-
-    # Delete only the 3 permanent leaderboard messages saved by the bot.
-    for key in [
-        'weekly_leaderboard_message_id',
-        'monthly_leaderboard_message_id',
-        'yearly_leaderboard_message_id'
-    ]:
-        message_id=meta_get(interaction.guild.id,key)
-        if message_id:
-            try:
-                msg=await ch.fetch_message(int(message_id))
-                await msg.delete()
-            except (discord.NotFound,discord.Forbidden,discord.HTTPException,ValueError):
-                pass
-            meta_set(interaction.guild.id,key,'')
-
-    # refresh_leaderboard now creates Yearly, Monthly, then Weekly last.
-    await refresh_leaderboard(interaction.guild)
-
-    await interaction.followup.send(
-        '✅ Reordered: **Yearly → Monthly → Weekly**. Weekly is now the newest/bottom board.',
-        ephemeral=True
-    )
 
 
 @bot.tree.command(name='leaderboard',description='Refresh weekly, monthly, and yearly leaderboards')
@@ -1108,41 +1299,6 @@ async def badgeguide(interaction:discord.Interaction):
         e.add_field(name=title,value=text,inline=False)
     await interaction.response.send_message(embed=e,ephemeral=False)
 
-
-@bot.tree.command(name='stats',description="Manager-only: view a rep's saved totals")
-async def stats(interaction:discord.Interaction,member:discord.Member):
-    if not interaction.guild:
-        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
-    if not is_manager(interaction.user):
-        return await interaction.response.send_message(
-            '❌ Only users with the **Manager** role can view another member\'s detailed stats.',
-            ephemeral=True
-        )
-
-    c=con()
-    r=c.execute(
-        'SELECT * FROM stats WHERE guild_id=? AND user_id=?',
-        (interaction.guild.id,member.id)
-    ).fetchone()
-    c.close()
-    if not r:
-        return await interaction.response.send_message('No stats yet.',ephemeral=True)
-
-    a=r['appointments']
-    e=discord.Embed(title=f"📈 {member.display_name}'s Saved Totals")
-    e.add_field(name='📅 Appointments',value=a)
-    e.add_field(name='📄 Bills',value=f"{r['bills']} ({(r['bills']/a*100 if a else 0):.0f}%)")
-    e.add_field(name='⏰ Within 48h',value=f"{r['within_48']} ({(r['within_48']/a*100 if a else 0):.0f}%)")
-    e.add_field(name='⚡ Same Day',value=r['same_day'])
-    e.add_field(name='💰 Setter Sales',value=r['sales'])
-    e.add_field(name='🤝 Closer Sales',value=r['closer_sales'])
-    await interaction.response.send_message(embed=e,ephemeral=True)
-
-
-UNDO_CHOICES = [
-    app_commands.Choice(name='Appointment', value='appointment'),
-    app_commands.Choice(name='Sale', value='sale'),
-]
 
 @bot.tree.command(name='undo',description='Manager-only: undo an accidental appointment or sale log')
 @app_commands.describe(
@@ -1516,13 +1672,6 @@ async def editstats(
         ephemeral=True
     )
 
-
-@bot.tree.command(name='badges',description="Show current automated badges")
-async def badges(interaction:discord.Interaction):
-    e=discord.Embed(title="🏅 Chosen Genesis Badges")
-    for name in DAILY+STREAK+WEEKLY:
-        r=discord.utils.get(interaction.guild.roles,name=name); holders=r.members if r else []; e.add_field(name=name,value=', '.join(m.mention for m in holders) if holders else 'Unclaimed',inline=False)
-    await interaction.response.send_message(embed=e)
 
 if not TOKEN: raise RuntimeError('DISCORD_TOKEN environment variable is missing')
 bot.run(TOKEN)
