@@ -397,9 +397,11 @@ async def refresh_leaderboard(guild):
     yearly.add_field(name='🤝 Closer Sales',value=fmt(ycl),inline=False)
     yearly.set_footer(text='Updates automatically when stats change.')
 
-    await upsert_board('weekly_leaderboard_message_id','🏆 Chosen Genesis — Weekly Leaderboard',weekly)
-    await upsert_board('monthly_leaderboard_message_id','📆 Chosen Genesis — Monthly Leaderboard',monthly)
+    # Desired channel order from top to bottom:
+    # Yearly -> Monthly -> Weekly. Weekly stays newest so it is what people see first.
     await upsert_board('yearly_leaderboard_message_id','🏆 Chosen Genesis — Yearly Leaderboard',yearly)
+    await upsert_board('monthly_leaderboard_message_id','📆 Chosen Genesis — Monthly Leaderboard',monthly)
+    await upsert_board('weekly_leaderboard_message_id','🏆 Chosen Genesis — Weekly Leaderboard',weekly)
 
 
 PERIOD_CHOICES = [
@@ -741,6 +743,52 @@ async def goalcheck(interaction:discord.Interaction):
     text='\n'.join(lines) if lines else 'No appointment activity recorded today.'
     await interaction.response.send_message(
         f"**Today's goal count: {total}/{DAILY_APPOINTMENT_GOAL}**\n\n{text}",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name='reorderleaderboards',
+    description='Manager-only: put Weekly at the bottom so it is seen first'
+)
+async def reorderleaderboards(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can reorder leaderboards.',
+            ephemeral=True
+        )
+
+    ch=await channel(interaction.guild,'leaderboard')
+    if not ch:
+        return await interaction.response.send_message(
+            'I could not find the **leaderboard** channel.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Delete only the 3 permanent leaderboard messages saved by the bot.
+    for key in [
+        'weekly_leaderboard_message_id',
+        'monthly_leaderboard_message_id',
+        'yearly_leaderboard_message_id'
+    ]:
+        message_id=meta_get(interaction.guild.id,key)
+        if message_id:
+            try:
+                msg=await ch.fetch_message(int(message_id))
+                await msg.delete()
+            except (discord.NotFound,discord.Forbidden,discord.HTTPException,ValueError):
+                pass
+            meta_set(interaction.guild.id,key,'')
+
+    # refresh_leaderboard now creates Yearly, Monthly, then Weekly last.
+    await refresh_leaderboard(interaction.guild)
+
+    await interaction.followup.send(
+        '✅ Reordered: **Yearly → Monthly → Weekly**. Weekly is now the newest/bottom board.',
         ephemeral=True
     )
 
