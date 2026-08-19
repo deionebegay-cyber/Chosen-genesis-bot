@@ -320,27 +320,55 @@ async def refresh_leaderboard(guild):
     ch=await channel(guild,'leaderboard')
     if not ch: return
 
-    def short_name(name,width=20):
+    # Discord mobile renders emoji inside monospace tables at inconsistent widths.
+    # Keep the exact scoreboard/table design, but use fixed-width text ranks (#1, #2, #3)
+    # inside code blocks so columns stay aligned on phone, tablet, and desktop.
+
+    def short_name(name,width=18):
         name=str(name)
         return name if len(name)<=width else name[:width-1]+'…'
 
-    def fmt_table(rs,label='APPTS'):
+    def scoreboard(rs,label='#'):
         if not rs:
             return '```text\nNo stats yet.\n```'
 
-        lines=[f"{'RK':<4} {'MEMBER':<20} {label:>6}",
-               f"{'─'*4} {'─'*20} {'─'*6}"]
-
+        lines=[f"{'RK':<4} {'NAME':<18} {label:>5}"]
         for i,r in enumerate(rs):
             member=guild.get_member(r['user_id'])
             name=member.display_name if member else f"User {r['user_id']}"
-            rank=['🥇','🥈','🥉'][i] if i<3 else f"#{i+1}"
-            value=r['value']
-            lines.append(f"{rank:<4} {short_name(name):<20} {str(value):>6}")
+            rank=f"#{i+1}"
+            lines.append(f"{rank:<4} {short_name(name):<18} {str(r['value']):>5}")
 
         return "```text\n" + "\n".join(lines) + "\n```"
 
-    def fmt_badges():
+    def sales_side_by_side(setters,closers):
+        if not setters and not closers:
+            return '```text\nNo stats yet.\n```'
+
+        lines=[f"{'SETTER':<18} {'CLOSER':<18}"]
+        max_rows=max(len(setters),len(closers),1)
+
+        for i in range(max_rows):
+            left=''
+            right=''
+
+            if i<len(setters):
+                r=setters[i]
+                m=guild.get_member(r['user_id'])
+                name=m.display_name if m else f"User {r['user_id']}"
+                left=f"#{i+1} {short_name(name,11)} {r['value']}"
+
+            if i<len(closers):
+                r=closers[i]
+                m=guild.get_member(r['user_id'])
+                name=m.display_name if m else f"User {r['user_id']}"
+                right=f"#{i+1} {short_name(name,11)} {r['value']}"
+
+            lines.append(f"{left:<18} {right:<18}")
+
+        return "```text\n" + "\n".join(lines) + "\n```"
+
+    def badge_scoreboard():
         rows=[]
         for badge in DAILY+STREAK+WEEKLY:
             role_obj=discord.utils.get(guild.roles,name=badge)
@@ -348,15 +376,16 @@ async def refresh_leaderboard(guild):
             if not holders:
                 continue
 
+            # Strip the leading emoji from the badge label inside the monospace table
+            # so mobile keeps the columns aligned.
             clean=badge.split(' ',1)[1] if ' ' in badge else badge
-            names=', '.join(short_name(m.display_name,16) for m in holders)
-            rows.append((clean,names))
+            holder_names=', '.join(short_name(m.display_name,14) for m in holders)
+            rows.append((clean,holder_names))
 
         if not rows:
             return '```text\nNo badges claimed yet.\n```'
 
-        lines=[f"{'BADGE':<18} {'HOLDER(S)'}",
-               f"{'─'*18} {'─'*28}"]
+        lines=[f"{'BADGE':<18} {'HOLDER(S)'}"]
         for badge,names in rows:
             lines.append(f"{short_name(badge,18):<18} {names}")
 
@@ -381,7 +410,7 @@ async def refresh_leaderboard(guild):
         msg=await ch.send(embed=embed)
         meta_set(guild.id,meta_key,str(msg.id))
 
-    # WEEKLY BOARD
+    # WEEKLY
     a=period_rows(guild.id,'week','appointments')
     s=period_rows(guild.id,'week','setter_sales')
     cl=period_rows(guild.id,'week','closer_sales')
@@ -390,42 +419,39 @@ async def refresh_leaderboard(guild):
 
     daily_pct=min(100,round(daily_appts/DAILY_APPOINTMENT_GOAL*100))
     monthly_pct=min(100,round(monthly_sales/MONTHLY_SALES_GOAL*100))
-    daily_bar=progress_bar(daily_appts,DAILY_APPOINTMENT_GOAL)
-    monthly_bar=progress_bar(monthly_sales,MONTHLY_SALES_GOAL)
 
     weekly=discord.Embed(
         title='🏆 Chosen Genesis — Weekly Leaderboard',
         description=(
             f'**🎯 DAILY APPOINTMENT GOAL**\n'
-            f'`{daily_bar}`  **{daily_appts}/{DAILY_APPOINTMENT_GOAL} • {daily_pct}%**\n\n'
+            f'`{progress_bar(daily_appts,DAILY_APPOINTMENT_GOAL)}`  '
+            f'**{daily_appts}/{DAILY_APPOINTMENT_GOAL} • {daily_pct}%**\n\n'
             f'**💰 MONTHLY SALES GOAL**\n'
-            f'`{monthly_bar}`  **{monthly_sales}/{MONTHLY_SALES_GOAL} • {monthly_pct}%**'
+            f'`{progress_bar(monthly_sales,MONTHLY_SALES_GOAL)}`  '
+            f'**{monthly_sales}/{MONTHLY_SALES_GOAL} • {monthly_pct}%**'
         ),
         timestamp=datetime.now(timezone.utc)
     )
-    weekly.add_field(name='📅 THIS WEEK — APPOINTMENTS',value=fmt_table(a,'APPTS'),inline=False)
-    weekly.add_field(name='💰 SETTER SALES',value=fmt_table(s,'SALES'),inline=True)
-    weekly.add_field(name='🤝 CLOSER SALES',value=fmt_table(cl,'SALES'),inline=True)
-    weekly.add_field(name='🏅 CURRENT BADGES',value=fmt_badges(),inline=False)
+    weekly.add_field(name='📅 THIS WEEK — APPOINTMENTS',value=scoreboard(a,'APPTS'),inline=False)
+    weekly.add_field(name='💰 SALES',value=sales_side_by_side(s,cl),inline=False)
+    weekly.add_field(name='🏅 CURRENT BADGES',value=badge_scoreboard(),inline=False)
     weekly.set_footer(text='Updates automatically when stats change.')
 
-    # MONTHLY BOARD
+    # MONTHLY
     ma=period_rows(guild.id,'month','appointments')
     ms=period_rows(guild.id,'month','setter_sales')
     mcl=period_rows(guild.id,'month','closer_sales')
-    month_label=now().strftime('%B %Y')
 
     monthly=discord.Embed(
         title='📆 Chosen Genesis — Monthly Leaderboard',
-        description=f'**{month_label.upper()}**',
+        description=f'**{now().strftime("%B %Y").upper()}**',
         timestamp=datetime.now(timezone.utc)
     )
-    monthly.add_field(name='📅 APPOINTMENTS',value=fmt_table(ma,'APPTS'),inline=False)
-    monthly.add_field(name='💰 SETTER SALES',value=fmt_table(ms,'SALES'),inline=True)
-    monthly.add_field(name='🤝 CLOSER SALES',value=fmt_table(mcl,'SALES'),inline=True)
+    monthly.add_field(name='📅 APPOINTMENTS',value=scoreboard(ma,'APPTS'),inline=False)
+    monthly.add_field(name='💰 SALES',value=sales_side_by_side(ms,mcl),inline=False)
     monthly.set_footer(text='Updates automatically when stats change.')
 
-    # YEARLY BOARD
+    # YEARLY
     ya=period_rows(guild.id,'year','appointments')
     ys=period_rows(guild.id,'year','setter_sales')
     ycl=period_rows(guild.id,'year','closer_sales')
@@ -435,12 +461,11 @@ async def refresh_leaderboard(guild):
         description=f'**{now().year}**',
         timestamp=datetime.now(timezone.utc)
     )
-    yearly.add_field(name='📅 APPOINTMENTS',value=fmt_table(ya,'APPTS'),inline=False)
-    yearly.add_field(name='💰 SETTER SALES',value=fmt_table(ys,'SALES'),inline=True)
-    yearly.add_field(name='🤝 CLOSER SALES',value=fmt_table(ycl,'SALES'),inline=True)
+    yearly.add_field(name='📅 APPOINTMENTS',value=scoreboard(ya,'APPTS'),inline=False)
+    yearly.add_field(name='💰 SALES',value=sales_side_by_side(ys,ycl),inline=False)
     yearly.set_footer(text='Updates automatically when stats change.')
 
-    # Keep Weekly newest/bottom so people see it first.
+    # Yearly -> Monthly -> Weekly, so Weekly remains newest / first seen.
     await upsert_board('yearly_leaderboard_message_id','🏆 Chosen Genesis — Yearly Leaderboard',yearly)
     await upsert_board('monthly_leaderboard_message_id','📆 Chosen Genesis — Monthly Leaderboard',monthly)
     await upsert_board('weekly_leaderboard_message_id','🏆 Chosen Genesis — Weekly Leaderboard',weekly)
