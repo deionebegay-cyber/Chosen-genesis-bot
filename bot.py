@@ -1300,6 +1300,11 @@ async def badgeguide(interaction:discord.Interaction):
     await interaction.response.send_message(embed=e,ephemeral=False)
 
 
+UNDO_CHOICES = [
+    app_commands.Choice(name='Appointment', value='appointment'),
+    app_commands.Choice(name='Sale', value='sale'),
+]
+
 @bot.tree.command(name='undo',description='Manager-only: undo an accidental appointment or sale log')
 @app_commands.describe(
     log_type='What type of log should be undone?',
