@@ -63,6 +63,9 @@ async def main(guild,content=None,embed=None):
     ch=await channel(guild,'main-chat')
     if ch: await ch.send(content=content,embed=embed)
 
+def is_manager(member):
+    return isinstance(member, discord.Member) and any(r.name.lower() == 'manager' for r in member.roles)
+
 async def role(guild,name):
     r=discord.utils.get(guild.roles,name=name)
     if not r: r=await guild.create_role(name=name,reason='Chosen Genesis automated badge')
@@ -274,6 +277,98 @@ async def stats(interaction:discord.Interaction,member:discord.Member|None=None)
     if not r: return await interaction.response.send_message('No stats yet.',ephemeral=True)
     a=r['appointments']; e=discord.Embed(title=f"📈 {member.display_name}'s Stats"); e.add_field(name='📅 Appointments',value=a); e.add_field(name='📄 Bills',value=f"{r['bills']} ({(r['bills']/a*100 if a else 0):.0f}%)"); e.add_field(name='⏰ Within 48h',value=f"{r['within_48']} ({(r['within_48']/a*100 if a else 0):.0f}%)"); e.add_field(name='💰 Setter Sales',value=r['sales']); e.add_field(name='🤝 Closer Sales',value=r['closer_sales']); e.add_field(name='🗣️ Pitches',value=r['pitches']); e.add_field(name='⏱️ Hours',value=f"{r['hours']:g}")
     await interaction.response.send_message(embed=e)
+
+
+STAT_CHOICES = [
+    app_commands.Choice(name='Appointments', value='appointments'),
+    app_commands.Choice(name='Bills', value='bills'),
+    app_commands.Choice(name='Within 48 Hours', value='within_48'),
+    app_commands.Choice(name='Same Day', value='same_day'),
+    app_commands.Choice(name='Setter Sales', value='sales'),
+    app_commands.Choice(name='Closer Sales', value='closer_sales'),
+    app_commands.Choice(name='Pitches', value='pitches'),
+    app_commands.Choice(name='Hours', value='hours'),
+]
+
+ACTION_CHOICES = [
+    app_commands.Choice(name='➕ Add', value='add'),
+    app_commands.Choice(name='➖ Remove', value='remove'),
+    app_commands.Choice(name='✏️ Set', value='set'),
+]
+
+@bot.tree.command(name='editstats',description='Manager-only stat correction')
+@app_commands.describe(
+    member='Member whose stats you want to change',
+    stat='Which stat to change',
+    action='Add, remove, or set',
+    amount='Amount to change'
+)
+@app_commands.choices(stat=STAT_CHOICES, action=ACTION_CHOICES)
+async def editstats(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    stat: app_commands.Choice[str],
+    action: app_commands.Choice[str],
+    amount: float
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can modify stats.',
+            ephemeral=True
+        )
+
+    if amount < 0:
+        return await interaction.response.send_message(
+            'Amount must be 0 or higher. Choose **Remove** to subtract.',
+            ephemeral=True
+        )
+
+    field = stat.value
+    allowed = {'appointments','bills','within_48','same_day','sales','closer_sales','pitches','hours'}
+    if field not in allowed:
+        return await interaction.response.send_message('Invalid stat.',ephemeral=True)
+
+    c=con()
+    c.execute('INSERT OR IGNORE INTO stats(guild_id,user_id) VALUES(?,?)',(interaction.guild.id,member.id))
+    r=c.execute(f'SELECT {field} value FROM stats WHERE guild_id=? AND user_id=?',
+                (interaction.guild.id,member.id)).fetchone()
+    current=float(r['value']) if r else 0.0
+
+    if action.value == 'add':
+        new_value=current+amount
+    elif action.value == 'remove':
+        new_value=max(0,current-amount)
+    else:
+        new_value=max(0,amount)
+
+    if field != 'hours':
+        new_value=int(round(new_value))
+
+    c.execute(f'UPDATE stats SET {field}=? WHERE guild_id=? AND user_id=?',
+              (new_value,interaction.guild.id,member.id))
+    c.commit(); c.close()
+
+    await refresh_leaderboard(interaction.guild)
+
+    labels={
+        'appointments':'Appointments',
+        'bills':'Bills',
+        'within_48':'Within 48 Hours',
+        'same_day':'Same Day',
+        'sales':'Setter Sales',
+        'closer_sales':'Closer Sales',
+        'pitches':'Pitches',
+        'hours':'Hours',
+    }
+
+    await interaction.response.send_message(
+        f"✅ {member.mention}'s **{labels[field]}** is now **{new_value:g}**.",
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name='badges',description="Show current automated badges")
 async def badges(interaction:discord.Interaction):
