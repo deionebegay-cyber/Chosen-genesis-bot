@@ -320,15 +320,15 @@ async def refresh_leaderboard(guild):
     ch=await channel(guild,'leaderboard')
     if not ch: return
 
-    # Discord mobile renders emoji inside monospace tables at inconsistent widths.
-    # Keep the exact scoreboard/table design, but use fixed-width text ranks (#1, #2, #3)
-    # inside code blocks so columns stay aligned on phone, tablet, and desktop.
+    # Mobile-safe fixed-width scoreboard formatting.
+    # Keep tables symmetrical, but stack Setter Sales and Closer Sales
+    # vertically so long names do not wrap or truncate on phones.
 
     def short_name(name,width=18):
         name=str(name)
         return name if len(name)<=width else name[:width-1]+'…'
 
-    def scoreboard(rs,label='#'):
+    def scoreboard(rs,label='VALUE'):
         if not rs:
             return '```text\nNo stats yet.\n```'
 
@@ -341,33 +341,6 @@ async def refresh_leaderboard(guild):
 
         return "```text\n" + "\n".join(lines) + "\n```"
 
-    def sales_side_by_side(setters,closers):
-        if not setters and not closers:
-            return '```text\nNo stats yet.\n```'
-
-        lines=[f"{'SETTER':<18} {'CLOSER':<18}"]
-        max_rows=max(len(setters),len(closers),1)
-
-        for i in range(max_rows):
-            left=''
-            right=''
-
-            if i<len(setters):
-                r=setters[i]
-                m=guild.get_member(r['user_id'])
-                name=m.display_name if m else f"User {r['user_id']}"
-                left=f"#{i+1} {short_name(name,11)} {r['value']}"
-
-            if i<len(closers):
-                r=closers[i]
-                m=guild.get_member(r['user_id'])
-                name=m.display_name if m else f"User {r['user_id']}"
-                right=f"#{i+1} {short_name(name,11)} {r['value']}"
-
-            lines.append(f"{left:<18} {right:<18}")
-
-        return "```text\n" + "\n".join(lines) + "\n```"
-
     def badge_scoreboard():
         rows=[]
         for badge in DAILY+STREAK+WEEKLY:
@@ -376,8 +349,6 @@ async def refresh_leaderboard(guild):
             if not holders:
                 continue
 
-            # Strip the leading emoji from the badge label inside the monospace table
-            # so mobile keeps the columns aligned.
             clean=badge.split(' ',1)[1] if ' ' in badge else badge
             holder_names=', '.join(short_name(m.display_name,14) for m in holders)
             rows.append((clean,holder_names))
@@ -433,7 +404,8 @@ async def refresh_leaderboard(guild):
         timestamp=datetime.now(timezone.utc)
     )
     weekly.add_field(name='📅 THIS WEEK — APPOINTMENTS',value=scoreboard(a,'APPTS'),inline=False)
-    weekly.add_field(name='💰 SALES',value=sales_side_by_side(s,cl),inline=False)
+    weekly.add_field(name='💰 SETTER SALES',value=scoreboard(s,'SALES'),inline=False)
+    weekly.add_field(name='🤝 CLOSER SALES',value=scoreboard(cl,'SALES'),inline=False)
     weekly.add_field(name='🏅 CURRENT BADGES',value=badge_scoreboard(),inline=False)
     weekly.set_footer(text='Updates automatically when stats change.')
 
@@ -448,7 +420,8 @@ async def refresh_leaderboard(guild):
         timestamp=datetime.now(timezone.utc)
     )
     monthly.add_field(name='📅 APPOINTMENTS',value=scoreboard(ma,'APPTS'),inline=False)
-    monthly.add_field(name='💰 SALES',value=sales_side_by_side(ms,mcl),inline=False)
+    monthly.add_field(name='💰 SETTER SALES',value=scoreboard(ms,'SALES'),inline=False)
+    monthly.add_field(name='🤝 CLOSER SALES',value=scoreboard(mcl,'SALES'),inline=False)
     monthly.set_footer(text='Updates automatically when stats change.')
 
     # YEARLY
@@ -462,7 +435,8 @@ async def refresh_leaderboard(guild):
         timestamp=datetime.now(timezone.utc)
     )
     yearly.add_field(name='📅 APPOINTMENTS',value=scoreboard(ya,'APPTS'),inline=False)
-    yearly.add_field(name='💰 SALES',value=sales_side_by_side(ys,ycl),inline=False)
+    yearly.add_field(name='💰 SETTER SALES',value=scoreboard(ys,'SALES'),inline=False)
+    yearly.add_field(name='🤝 CLOSER SALES',value=scoreboard(ycl,'SALES'),inline=False)
     yearly.set_footer(text='Updates automatically when stats change.')
 
     # Yearly -> Monthly -> Weekly, so Weekly remains newest / first seen.
