@@ -49,6 +49,150 @@ SALE_ANNOUNCEMENTS = [
     ("⚡ CASHED IN", "Another opportunity turned into a deal."),
 ]
 
+
+WELCOME_MESSAGES = [
+    ("🚨 NEW RECRUIT", "Welcome {mention} to **Chosen Genesis**. 🫡\n\nThe board is at zero. Time to earn your name.\n\n**Everybody welcome them in. 🔥**"),
+    ("🪖 REINFORCEMENTS HAVE ARRIVED", "{mention} just joined **Chosen Genesis**.\n\nShow them how we do things around here. 🫡"),
+    ("👀 WHO LET THIS GUY IN?", "Welcome {mention} to **Chosen Genesis** 😂🔥\n\n**Team, show some love.**"),
+    ("🔥 WELCOME TO CHOSEN GENESIS", "{mention} is officially in.\n\n**Drop a 🫡 and welcome them to the team.**"),
+    ("⚔️ ANOTHER ONE JOINS THE RANKS", "{mention}, welcome to **Chosen Genesis**.\n\nNew name. Fresh board. Let's work. 🔥"),
+]
+
+PRESSURE_COPY = {
+    '🎯 Point Man': [
+        "🎯 **POINT MAN RACE**\n{names} are tied at **{value} appointments**.\n\n**Somebody break it. 👀**",
+        "🎯 **DEADLOCK AT THE TOP**\n{names} are sitting at **{value} appointments**.\n\n**Who's taking Point Man? 😈**",
+        "🎯 **POINT MAN IS UP FOR GRABS**\n{names} are tied at **{value}**.\n\n**Next appointment changes the board.**",
+    ],
+    '📄 Bounty Hunter': [
+        "📄 **BOUNTY HUNTER DEADLOCK**\n{names} are tied with **{value} bills**.\n\n**Somebody go break the tie.**",
+        "📄 **THE BOUNTY IS OPEN**\n{names} are tied at **{value} bills**.\n\n**Who's collecting the next one? 👀**",
+        "📄 **BILL RACE**\n{names} are neck-and-neck with **{value}**.\n\n**Go take it.**",
+    ],
+    '⚡ Same Day Savage': [
+        "⚡ **SAME DAY RACE**\n{names} are tied at **{value} same-days**.\n\n**Next one takes the lead.**",
+        "⚡ **SAVAGE BADGE IS OPEN**\n{names} are tied with **{value} same-days**.\n\n**Who's separating themselves? 👀**",
+        "⚡ **TIE GAME**\n{names} both have **{value} same-days**.\n\n**Somebody apply pressure.**",
+    ],
+    '⏰ Speed Demon': [
+        "⏰ **SPEED DEMON RACE**\n{names} are tied at **{value} within-48 appointments**.\n\n**Who's moving first? 👀**",
+        "⏰ **TOO CLOSE TO CALL**\n{names} are tied with **{value}**.\n\n**Next one could take Speed Demon.**",
+        "⏰ **SPEED CHECK**\n{names} are neck-and-neck at **{value}**.\n\n**Pick up the pace. 😈**",
+    ],
+}
+
+# Minimum totals before a tie is worth interrupting the chat.
+PRESSURE_MINIMUMS = {
+    '🎯 Point Man': 3,
+    '📄 Bounty Hunter': 2,
+    '⚡ Same Day Savage': 2,
+    '⏰ Speed Demon': 2,
+}
+
+def pressure_key(badge):
+    return ''.join(ch for ch in badge if ch.isalnum() or ch=='_')
+
+def daily_metric_snapshot(g,metric):
+    c=con()
+    today=dkey()
+    if metric=='appointments':
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,today)
+        ).fetchall(); stat='appointments'
+    elif metric=='bills':
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(bill_collected),0) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,today)
+        ).fetchall(); stat='bills'
+    elif metric=='same_day':
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(same_day),0) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,today)
+        ).fetchall(); stat='same_day'
+    else:
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(within_48),0) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,today)
+        ).fetchall(); stat='within_48'
+    totals={r['user_id']:float(r['value'] or 0) for r in rows}
+    adj=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',
+        (g,stat,today)
+    ).fetchall()
+    c.close()
+    for r in adj:
+        totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+    totals={u:int(v) for u,v in totals.items() if v>0}
+    if not totals:
+        return [],0
+    high=max(totals.values())
+    return [u for u,v in totals.items() if v==high],high
+
+async def maybe_pressure_message(guild,badge,metric):
+    leaders,value=daily_metric_snapshot(guild.id,metric)
+    if len(leaders)<2 or value<PRESSURE_MINIMUMS.get(badge,2):
+        return
+
+    # One tie-pressure post per badge per day. The bot starts the conversation
+    # and then gets out of the way.
+    key=f"pressure_{pressure_key(badge)}_{dkey()}"
+    if meta_get(guild.id,key):
+        return
+
+    names=[]
+    for uid in leaders[:4]:
+        member=guild.get_member(uid)
+        names.append(member.mention if member else f'<@{uid}>')
+    text=random.choice(PRESSURE_COPY[badge]).format(
+        names=' and '.join(names),
+        value=value
+    )
+    await main(guild,content=text)
+    meta_set(guild.id,key,'1')
+
+async def maybe_night_owl_watch(guild,new_holder_id):
+    # Night Owl chatter only starts in the evening.
+    if now().hour < 18:
+        return
+
+    today=dkey()
+    holder=guild.get_member(new_holder_id)
+    if not holder:
+        return
+
+    holder_key=f'night_owl_live_holder_{today}'
+    old_raw=meta_get(guild.id,holder_key)
+    old_id=int(old_raw) if old_raw and str(old_raw).isdigit() else None
+
+    # First evening holder: one "watch" message maximum.
+    watch_key=f'night_owl_watch_{today}'
+    stolen_key=f'night_owl_stolen_{today}'
+
+    if old_id is None:
+        meta_set(guild.id,holder_key,str(new_holder_id))
+        if not meta_get(guild.id,watch_key):
+            await main(
+                guild,
+                content=f'🦉 **NIGHT OWL WATCH**\n{holder.mention} currently has the latest appointment of the night.\n\n**Are they keeping it… or is somebody stealing it? 👀**'
+            )
+            meta_set(guild.id,watch_key,'1')
+        return
+
+    if old_id==new_holder_id:
+        return
+
+    # Only one steal message for the whole night to avoid bot spam.
+    meta_set(guild.id,holder_key,str(new_holder_id))
+    if not meta_get(guild.id,stolen_key):
+        old=guild.get_member(old_id)
+        old_text=old.mention if old else f'<@{old_id}>'
+        await main(
+            guild,
+            content=f'🦉 **NIGHT OWL STOLEN**\n{holder.mention} just took the latest appointment from {old_text}.\n\n**Clock’s still running. 😈**'
+        )
+        meta_set(guild.id,stolen_key,'1')
+
 def pick_announcement(pool):
     return random.choice(pool)
 
@@ -994,6 +1138,19 @@ class Genesis(commands.Bot):
 bot=Genesis(command_prefix='!',intents=intents)
 
 @bot.event
+async def on_member_join(member):
+    if member.bot:
+        return
+    title,description=random.choice(WELCOME_MESSAGES)
+    e=discord.Embed(
+        title=title,
+        description=description.format(mention=member.mention),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_footer(text='Chosen Genesis')
+    await main(member.guild,embed=e)
+
+@bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
     for g in bot.guilds:
@@ -1084,6 +1241,14 @@ async def appointment(
         await main(interaction.guild,content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!')
 
     await refresh_daily_comp(interaction.guild)
+
+    # Low-frequency competitive prompts: max one tie prompt per badge/day.
+    await maybe_pressure_message(interaction.guild,'🎯 Point Man','appointments')
+    await maybe_pressure_message(interaction.guild,'📄 Bounty Hunter','bills')
+    await maybe_pressure_message(interaction.guild,'⚡ Same Day Savage','same_day')
+    await maybe_pressure_message(interaction.guild,'⏰ Speed Demon','within_48')
+    await maybe_night_owl_watch(interaction.guild,setter.id)
+
     await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
 
