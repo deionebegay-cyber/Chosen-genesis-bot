@@ -34,6 +34,10 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id INTEGER,setter_id INTEGER,closer_id INTEGER,
       utility TEXT,local_date TEXT,local_hour INTEGER,week_key TEXT,created_at TEXT);
     CREATE TABLE IF NOT EXISTS meta(guild_id INTEGER,key TEXT,value TEXT,PRIMARY KEY(guild_id,key));
+    CREATE TABLE IF NOT EXISTS stat_adjustments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,stat_name TEXT,amount REAL,
+      local_date TEXT,week_key TEXT,created_at TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -99,24 +103,67 @@ async def clear_roles(guild,names):
                 try: await m.remove_roles(r,reason='Badge reset')
                 except discord.Forbidden: pass
 
+
+def adjustment_sum(g,u,stat,start_date,end_date):
+    c=con(); r=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
+        (g,u,stat,start_date,end_date)).fetchone(); c.close(); return float(r['v'] or 0)
+
+def record_adjustment(g,u,stat,amount,local_date):
+    if abs(amount) < 1e-9: return
+    try: d=datetime.strptime(local_date,'%Y-%m-%d').date()
+    except ValueError: return
+    c=con(); c.execute(
+        'INSERT INTO stat_adjustments(guild_id,user_id,stat_name,amount,local_date,week_key,created_at) VALUES(?,?,?,?,?,?,?)',
+        (g,u,stat,amount,local_date,wkey(d),datetime.now(timezone.utc).isoformat()))
+    c.commit(); c.close()
+
+def resolved_edit_date(date_mode,custom_date):
+    today=now().date()
+    if date_mode=='today': return today
+    if date_mode=='yesterday': return today-timedelta(days=1)
+    if date_mode=='custom':
+        if not custom_date: return None
+        try: return datetime.strptime(custom_date,'%Y-%m-%d').date()
+        except ValueError: return None
+    return today
+
+def daily_metric_totals(g,metric):
+    today=dkey(); c=con(); totals={}
+    if metric=='appointments':
+        rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
+        stat='appointments'
+    elif metric=='bills':
+        rows=c.execute('SELECT setter_id user_id,SUM(bill_collected) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
+        stat='bills'
+    elif metric=='same_day':
+        rows=c.execute('SELECT setter_id user_id,SUM(same_day) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
+        stat='same_day'
+    else:
+        rows=c.execute('SELECT setter_id user_id,SUM(within_48) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
+        stat='within_48'
+    for r in rows: totals[r['user_id']]=float(r['value'] or 0)
+    adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',(g,stat,today)).fetchall()
+    c.close()
+    for r in adj: totals[r['user_id']]=totals.get(r['user_id'],0)+float(r['value'] or 0)
+    return {u:max(0,v) for u,v in totals.items()}
+
 def daily_leaders(g,metric):
-    c=con(); today=dkey()
-    if metric=='appointments': q='SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id'
-    elif metric=='bills': q='SELECT setter_id user_id,SUM(bill_collected) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id'
-    elif metric=='same_day': q='SELECT setter_id user_id,SUM(same_day) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id'
-    else: q='SELECT setter_id user_id,SUM(within_48) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id'
-    rows=c.execute(q,(g,today)).fetchall(); c.close()
-    rows=[r for r in rows if r['value'] and r['value']>0]
-    if not rows: return []
-    best=max(r['value'] for r in rows)
-    return [r['user_id'] for r in rows if r['value']==best]
+    totals=daily_metric_totals(g,metric)
+    totals={u:v for u,v in totals.items() if v>0}
+    if not totals: return []
+    best=max(totals.values())
+    return [u for u,v in totals.items() if v==best]
 
 async def refresh_daily_comp(guild):
     for metric,badge in [('appointments','🎯 Point Man'),('bills','📄 Bounty Hunter'),('same_day','⚡ Same Day Savage'),('within_48','⏰ Speed Demon')]:
         await set_holders(guild,badge,daily_leaders(guild.id,metric))
 
 def closer_sales_today(g,u):
-    c=con(); n=c.execute('SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND closer_id=? AND local_date=?',(g,u,dkey())).fetchone()['c']; c.close(); return n
+    today=dkey(); c=con()
+    n=c.execute('SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND closer_id=? AND local_date=?',(g,u,today)).fetchone()['c']
+    a=c.execute('SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=? AND local_date=?',(g,u,'closer_sales',today)).fetchone()['v']
+    c.close(); return max(0,int(n+(a or 0)))
 
 def first_setter(g):
     c=con(); r=c.execute('SELECT setter_id FROM appointment_events WHERE guild_id=? AND local_date=? ORDER BY id LIMIT 1',(g,dkey())).fetchone(); c.close(); return r['setter_id'] if r else None
@@ -142,12 +189,17 @@ async def refresh_streaks(guild):
     await set_holders(guild,'🧊 Ice Cold',[u for u in closers if streak(guild.id,u,'sale_events','closer_id',3)])
 
 def week_winners(g,wk,kind):
-    c=con()
-    if kind=='setter': rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND week_key=? GROUP BY setter_id',(g,wk)).fetchall()
-    else: rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND week_key=? GROUP BY closer_id',(g,wk)).fetchall()
-    c.close()
-    if not rows: return [],0
-    best=max(r['value'] for r in rows); return [r['user_id'] for r in rows if r['value']==best],best
+    c=con(); totals={}
+    if kind=='setter':
+        rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND week_key=? GROUP BY setter_id',(g,wk)).fetchall(); stat='appointments'
+    else:
+        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND week_key=? GROUP BY closer_id',(g,wk)).fetchall(); stat='closer_sales'
+    for r in rows: totals[r['user_id']]=float(r['value'] or 0)
+    adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND week_key=? AND stat_name=? GROUP BY user_id',(g,wk,stat)).fetchall(); c.close()
+    for r in adj: totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+    totals={u:v for u,v in totals.items() if v>0}
+    if not totals: return [],0
+    best=max(totals.values()); return [u for u,v in totals.items() if v==best],best
 
 async def weekly_kings(guild):
     if now().weekday()!=0: return
@@ -168,15 +220,19 @@ async def restore_daily(guild):
     if f:
         m=guild.get_member(f)
         if m: await add_role(guild,m,'🩸 First Blood')
-    c=con(); rows=c.execute('SELECT closer_id,COUNT(*) c,MAX(local_hour) h FROM sale_events WHERE guild_id=? AND local_date=? GROUP BY closer_id',(guild.id,dkey())).fetchall(); c.close()
+    c=con(); rows=c.execute('SELECT closer_id,COUNT(*) c,MAX(local_hour) h FROM sale_events WHERE guild_id=? AND local_date=? GROUP BY closer_id',(guild.id,dkey())).fetchall()
+    actual={r['closer_id']:{'c':int(r['c'] or 0),'h':int(r['h'] or 0)} for r in rows}
+    adj=c.execute('SELECT user_id,SUM(amount) v FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',(guild.id,'closer_sales',dkey())).fetchall(); c.close()
+    totals={u:data['c'] for u,data in actual.items()}
+    for r in adj: totals[r['user_id']]=max(0,int(totals.get(r['user_id'],0)+float(r['v'] or 0)))
     ghosts=[]
-    for r in rows:
-        m=guild.get_member(r['closer_id'])
+    for uid,count in totals.items():
+        m=guild.get_member(uid)
         if not m: continue
-        if r['c']>=1: await add_role(guild,m,'💥 Sale')
-        if r['c']>=2: await add_role(guild,m,'🥈 2 Spot')
-        if r['c']>=3: await add_role(guild,m,'🎩 Hattrick')
-        if r['h']>=19: ghosts.append(r['closer_id'])
+        if count>=1: await add_role(guild,m,'💥 Sale')
+        if count>=2: await add_role(guild,m,'🥈 2 Spot')
+        if count>=3: await add_role(guild,m,'🎩 Hattrick')
+        if actual.get(uid,{}).get('h',0)>=19: ghosts.append(uid)
     await set_holders(guild,'👻 Ghost Hunter',ghosts)
     await refresh_daily_comp(guild)
 
@@ -236,33 +292,20 @@ def period_rows(guild_id,period,kind):
     c=con()
     if period=='all':
         field={'appointments':'appointments','setter_sales':'sales','closer_sales':'closer_sales'}[kind]
-        rows=c.execute(
-            f'SELECT user_id,{field} value FROM stats WHERE guild_id=? AND {field}>0 ORDER BY {field} DESC LIMIT 10',
-            (guild_id,)
-        ).fetchall()
-    elif kind=='appointments':
-        rows=c.execute(
-            'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
-            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
-            'GROUP BY setter_id ORDER BY value DESC LIMIT 10',
-            (guild_id,start,end)
-        ).fetchall()
+        rows=c.execute(f'SELECT user_id,{field} value FROM stats WHERE guild_id=? AND {field}>0 ORDER BY {field} DESC LIMIT 10',(guild_id,)).fetchall(); c.close(); return rows
+
+    totals={}
+    if kind=='appointments':
+        rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',(guild_id,start,end)).fetchall(); stat='appointments'
     elif kind=='setter_sales':
-        rows=c.execute(
-            'SELECT setter_id user_id,COUNT(*) value FROM sale_events '
-            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
-            'GROUP BY setter_id ORDER BY value DESC LIMIT 10',
-            (guild_id,start,end)
-        ).fetchall()
+        rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',(guild_id,start,end)).fetchall(); stat='sales'
     else:
-        rows=c.execute(
-            'SELECT closer_id user_id,COUNT(*) value FROM sale_events '
-            'WHERE guild_id=? AND local_date BETWEEN ? AND ? '
-            'GROUP BY closer_id ORDER BY value DESC LIMIT 10',
-            (guild_id,start,end)
-        ).fetchall()
-    c.close()
-    return rows
+        rows=c.execute('SELECT closer_id user_id,COUNT(*) value FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY closer_id',(guild_id,start,end)).fetchall(); stat='closer_sales'
+    for r in rows: totals[r['user_id']]=float(r['value'] or 0)
+    adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ? GROUP BY user_id',(guild_id,stat,start,end)).fetchall(); c.close()
+    for r in adj: totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+    data=sorted(((u,v) for u,v in totals.items() if v>0),key=lambda x:x[1],reverse=True)[:10]
+    return [{'user_id':u,'value':int(v) if float(v).is_integer() else v} for u,v in data]
 
 async def show_period_leaderboard(guild,period='all'):
     ch=await channel(guild,'leaderboard')
@@ -476,6 +519,12 @@ async def undo(
         ephemeral=True
     )
 
+EDIT_DATE_CHOICES = [
+    app_commands.Choice(name='Today', value='today'),
+    app_commands.Choice(name='Yesterday', value='yesterday'),
+    app_commands.Choice(name='Custom Date', value='custom'),
+]
+
 STAT_CHOICES = [
     app_commands.Choice(name='Appointments', value='appointments'),
     app_commands.Choice(name='Bills', value='bills'),
@@ -493,76 +542,62 @@ ACTION_CHOICES = [
     app_commands.Choice(name='✏️ Set', value='set'),
 ]
 
-@bot.tree.command(name='editstats',description='Manager-only: add, remove, or set saved totals')
+@bot.tree.command(name='editstats',description='Manager-only: correct stats and leaderboard history')
 @app_commands.describe(
     member='Member whose stats you want to change',
     stat='Which stat to change',
     action='Add, remove, or set',
-    amount='Amount to change'
+    amount='Amount to change',
+    date='When should this correction count?',
+    custom_date='Only for Custom Date: YYYY-MM-DD'
 )
-@app_commands.choices(stat=STAT_CHOICES, action=ACTION_CHOICES)
+@app_commands.choices(stat=STAT_CHOICES, action=ACTION_CHOICES, date=EDIT_DATE_CHOICES)
 async def editstats(
     interaction: discord.Interaction,
     member: discord.Member,
     stat: app_commands.Choice[str],
     action: app_commands.Choice[str],
-    amount: float
+    amount: float,
+    date: app_commands.Choice[str],
+    custom_date: str|None=None
 ):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
-
     if not is_manager(interaction.user):
-        return await interaction.response.send_message(
-            '❌ Only users with the **Manager** role can modify stats.',
-            ephemeral=True
-        )
-
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can modify stats.',ephemeral=True)
     if amount < 0:
-        return await interaction.response.send_message(
-            'Amount must be 0 or higher. Choose **Remove** to subtract.',
-            ephemeral=True
-        )
+        return await interaction.response.send_message('Amount must be 0 or higher. Choose **Remove** to subtract.',ephemeral=True)
 
-    field = stat.value
-    allowed = {'appointments','bills','within_48','same_day','sales','closer_sales','pitches','hours'}
+    edit_date=resolved_edit_date(date.value,custom_date)
+    if not edit_date:
+        return await interaction.response.send_message('❌ For Custom Date, enter the date like **2026-08-19**.',ephemeral=True)
+
+    field=stat.value
+    allowed={'appointments','bills','within_48','same_day','sales','closer_sales','pitches','hours'}
     if field not in allowed:
         return await interaction.response.send_message('Invalid stat.',ephemeral=True)
 
-    c=con()
-    c.execute('INSERT OR IGNORE INTO stats(guild_id,user_id) VALUES(?,?)',(interaction.guild.id,member.id))
-    r=c.execute(f'SELECT {field} value FROM stats WHERE guild_id=? AND user_id=?',
-                (interaction.guild.id,member.id)).fetchone()
+    c=con(); c.execute('INSERT OR IGNORE INTO stats(guild_id,user_id) VALUES(?,?)',(interaction.guild.id,member.id))
+    r=c.execute(f'SELECT {field} value FROM stats WHERE guild_id=? AND user_id=?',(interaction.guild.id,member.id)).fetchone()
     current=float(r['value']) if r else 0.0
 
-    if action.value == 'add':
-        new_value=current+amount
-    elif action.value == 'remove':
-        new_value=max(0,current-amount)
-    else:
-        new_value=max(0,amount)
+    if action.value=='add': new_value=current+amount
+    elif action.value=='remove': new_value=max(0,current-amount)
+    else: new_value=max(0,amount)
 
-    if field != 'hours':
-        new_value=int(round(new_value))
+    if field!='hours': new_value=int(round(new_value))
+    delta=new_value-current
 
-    c.execute(f'UPDATE stats SET {field}=? WHERE guild_id=? AND user_id=?',
-              (new_value,interaction.guild.id,member.id))
-    c.commit(); c.close()
+    c.execute(f'UPDATE stats SET {field}=? WHERE guild_id=? AND user_id=?',(new_value,interaction.guild.id,member.id)); c.commit(); c.close()
+    record_adjustment(interaction.guild.id,member.id,field,delta,edit_date.isoformat())
 
+    await restore_daily(interaction.guild)
+    await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
 
-    labels={
-        'appointments':'Appointments',
-        'bills':'Bills',
-        'within_48':'Within 48 Hours',
-        'same_day':'Same Day',
-        'sales':'Setter Sales',
-        'closer_sales':'Closer Sales',
-        'pitches':'Pitches',
-        'hours':'Hours',
-    }
-
+    labels={'appointments':'Appointments','bills':'Bills','within_48':'Within 48 Hours','same_day':'Same Day','sales':'Setter Sales','closer_sales':'Closer Sales','pitches':'Pitches','hours':'Hours'}
     await interaction.response.send_message(
-        f"✅ {member.mention}'s **{labels[field]}** is now **{new_value:g}**.",
+        f"✅ {member.mention}'s **{labels[field]}** is now **{new_value:g}**. The {delta:+g} correction counts on **{edit_date.isoformat()}**.",
         ephemeral=True
     )
 
