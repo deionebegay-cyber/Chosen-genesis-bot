@@ -450,18 +450,13 @@ async def refresh_leaderboard(guild):
             if not holders:
                 continue
 
-            clean=badge.split(' ',1)[1] if ' ' in badge else badge
-            holder_names=', '.join(short_name(m.display_name,14) for m in holders)
-            rows.append((clean,holder_names))
+            # Keep the badge's actual emoji visible.
+            # Normal Discord text is used here because emoji widths can break
+            # monospace alignment on mobile.
+            holder_names=', '.join(m.display_name for m in holders)
+            rows.append(f"**{badge}** — {holder_names}")
 
-        if not rows:
-            return '```text\nNo badges claimed yet.\n```'
-
-        lines=[f"{'BADGE':<18} {'HOLDER(S)'}"]
-        for badge,names in rows:
-            lines.append(f"{short_name(badge,18):<18} {names}")
-
-        return "```text\n" + "\n".join(lines) + "\n```"
+        return "\n".join(rows) if rows else "No badges claimed yet."
 
     async def upsert_board(meta_key,title,embed):
         saved_id=meta_get(guild.id,meta_key)
