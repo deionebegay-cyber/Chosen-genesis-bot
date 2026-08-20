@@ -31,6 +31,21 @@ BADGE_DESCRIPTIONS = {
     '👑 Closer King':'Most closer sales for the week.'
 }
 
+BADGE_POINT_VALUES = {
+    '🩸 First Blood':1,
+    '🦉 Night Owl':1,
+    '👻 Ghost Hunter':1,
+    '🎯 Point Man':1,
+    '📄 Bounty Hunter':1,
+    '⚡ Same Day Savage':1,
+    '⏰ Speed Demon':1,
+    '💥 Sale':1,
+    '🥈 2 Spot':1,
+    '🎩 Hattrick':1,
+    '🔥 Hot Streak':1,
+    '🧊 Ice Cold':1,
+}
+
 APPOINTMENT_ANNOUNCEMENTS = [
     ("📅 APPOINTMENT ON THE BOARD", "Another opportunity created. Keep stacking."),
     ("🚪 DOORS → OPPORTUNITIES", "Another one added to the calendar."),
@@ -549,8 +564,8 @@ async def weekly_recap(guild,week_key):
 
     appts=team_week_total(guild.id,week_key,'appointments')
     sales=team_week_total(guild.id,week_key,'sales')
-    setters,setter_count=week_winners(guild.id,week_key,'setter')
-    closers,closer_count=week_winners(guild.id,week_key,'closer')
+    setters,setter_count,_=king_winners(guild.id,week_key,'setter')
+    closers,closer_count,_=king_winners(guild.id,week_key,'closer')
     bill_winners,bill_count=week_metric_winners(guild.id,week_key,'bills')
     sd_winners,sd_count=week_metric_winners(guild.id,week_key,'same_day')
 
@@ -694,6 +709,37 @@ async def refresh_streaks(guild):
         if award_badge_count(guild.id,uid,'🧊 Ice Cold',dkey()):
             await announce_badge_milestone(guild,uid,'🧊 Ice Cold')
 
+
+def weekly_badge_points(g,user_id,wk):
+    start_date,end_date=week_date_bounds_from_key(wk)
+    c=con()
+    rows=c.execute(
+        'SELECT badge_name,COUNT(*) c FROM badge_awards '
+        'WHERE guild_id=? AND user_id=? AND award_key BETWEEN ? AND ? '
+        'GROUP BY badge_name',
+        (g,user_id,start_date,end_date)
+    ).fetchall()
+    c.close()
+
+    total=0
+    for r in rows:
+        total += int(r['c'] or 0) * int(BADGE_POINT_VALUES.get(r['badge_name'],0))
+    return total
+
+def king_winners(g,wk,kind):
+    leaders,production=week_winners(g,wk,kind)
+    if len(leaders)<=1:
+        points={u:weekly_badge_points(g,u,wk) for u in leaders}
+        return leaders,production,points
+
+    points={u:weekly_badge_points(g,u,wk) for u in leaders}
+    best=max(points.values()) if points else 0
+    winners=[u for u in leaders if points.get(u,0)==best]
+
+    # If badge points are also tied, the remaining tied reps share the crown.
+    return winners,production,points
+
+
 def week_winners(g,wk,kind):
     c=con(); totals={}
     if kind=='setter':
@@ -708,23 +754,65 @@ def week_winners(g,wk,kind):
     best=max(totals.values()); return [u for u,v in totals.items() if v==best],best
 
 async def weekly_kings(guild):
-    if now().weekday()!=0: return
-    prev=now().date()-timedelta(days=1); wk=wkey(prev)
-    if meta_get(guild.id,'weekly_awarded')==wk: return
-    s,sc=week_winners(guild.id,wk,'setter'); c,cc=week_winners(guild.id,wk,'closer')
-    await set_holders(guild,'👑 Setter King',s); await set_holders(guild,'👑 Closer King',c)
-    for uid in s:
+    # Current visible Kings are based on the LAST completed week.
+    today=now().date()
+    current_week_start=today-timedelta(days=today.weekday())
+    prev_week_end=current_week_start-timedelta(days=1)
+    wk=wkey(prev_week_end)
+
+    setters,setter_score,setter_points=king_winners(guild.id,wk,'setter')
+    closers,closer_score,closer_points=king_winners(guild.id,wk,'closer')
+
+    await set_holders(guild,'👑 Setter King',setters)
+    await set_holders(guild,'👑 Closer King',closers)
+
+    for uid in setters:
         if award_badge_count(guild.id,uid,'👑 Setter King',wk):
             await announce_badge_milestone(guild,uid,'👑 Setter King')
-    for uid in c:
+    for uid in closers:
         if award_badge_count(guild.id,uid,'👑 Closer King',wk):
             await announce_badge_milestone(guild,uid,'👑 Closer King')
-    if s or c:
-        e=discord.Embed(title='👑 WEEKLY KINGS')
-        e.add_field(name='👑 Setter King',value=(", ".join(f'<@{x}>' for x in s)+f' — **{sc} appointments**') if s else 'No winner',inline=False)
-        e.add_field(name='👑 Closer King',value=(", ".join(f'<@{x}>' for x in c)+f' — **{cc} sales**') if c else 'No winner',inline=False)
+
+    if meta_get(guild.id,'weekly_awarded')==wk:
+        return
+
+    if setters or closers:
+        e=discord.Embed(
+            title='👑 CHOSEN GENESIS — NEW WEEKLY KINGS',
+            description=(
+                'Last week is locked. The crowns are live for this week. 🔥\n\n'
+                '**Tiebreaker:** weekly badge points. If badge points are still tied, the crown is shared.'
+            ),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        if setters:
+            setter_text=[]
+            for uid in setters:
+                setter_text.append(
+                    f'<@{uid}> — **{setter_score:g} appointments** • **{setter_points.get(uid,0)} badge pts**'
+                )
+            setter_value='\n'.join(setter_text)
+        else:
+            setter_value='No winner'
+
+        if closers:
+            closer_text=[]
+            for uid in closers:
+                closer_text.append(
+                    f'<@{uid}> — **{closer_score:g} sales** • **{closer_points.get(uid,0)} badge pts**'
+                )
+            closer_value='\n'.join(closer_text)
+        else:
+            closer_value='No winner'
+
+        e.add_field(name='👑 Setter King',value=setter_value,inline=False)
+        e.add_field(name='👑 Closer King',value=closer_value,inline=False)
+        e.set_footer(text='Kings keep the crown role until the next weekly rollover.')
         await main(guild,embed=e)
+
     meta_set(guild.id,'weekly_awarded',wk)
+
 
 async def restore_daily(guild):
     await clear_roles(guild,DAILY)
@@ -1166,6 +1254,7 @@ async def maintenance():
         if meta_get(g.id,'daily_date')!=dkey():
             await clear_roles(g,DAILY); meta_set(g.id,'daily_date',dkey()); await restore_daily(g)
         await refresh_streaks(g)
+        # Keep cosmetic King roles synced all week.
         await weekly_kings(g)
         if now().weekday()==0:
             prev=now().date()-timedelta(days=1)
