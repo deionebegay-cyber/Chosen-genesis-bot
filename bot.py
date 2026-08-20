@@ -27,7 +27,7 @@ BADGE_DESCRIPTIONS = {
     '🎩 Hattrick':'3 sales in a day.',
     '🔥 Hot Streak':'Appointment on 5 straight workdays.',
     '🧊 Ice Cold':'Sale on 3 straight workdays.',
-    '👑 Setter King':'Most appointments for the week.',
+    '👑 Setter King':'Most setter sales for the week; appointments break ties.',
     '👑 Closer King':'Most closer sales for the week.'
 }
 
@@ -564,7 +564,7 @@ async def weekly_recap(guild,week_key):
 
     appts=team_week_total(guild.id,week_key,'appointments')
     sales=team_week_total(guild.id,week_key,'sales')
-    setters,setter_count,_=king_winners(guild.id,week_key,'setter')
+    setters,setter_count,setter_appts,_=setter_king_winners(guild.id,week_key)
     closers,closer_count,_=king_winners(guild.id,week_key,'closer')
     bill_winners,bill_count=week_metric_winners(guild.id,week_key,'bills')
     sd_winners,sd_count=week_metric_winners(guild.id,week_key,'same_day')
@@ -597,7 +597,7 @@ async def weekly_recap(guild,week_key):
     e.add_field(name='📅 Team Appointments',value=f'**{appts}**',inline=True)
     e.add_field(name='💰 Team Sales',value=f'**{sales}**',inline=True)
     e.add_field(name='🔥 Personal Bests',value=f'**{int(pb_count or 0)}** broken',inline=True)
-    e.add_field(name='👑 Setter King',value=f'**{names(setters)}** — {setter_count} appointments',inline=False)
+    e.add_field(name='👑 Setter King',value=f'**{names(setters)}** — {setter_count} setter sales' + (f' • {max((setter_appts.get(x,0) for x in setters),default=0)} appointments' if setters else ''),inline=False)
     e.add_field(name='👑 Closer King',value=f'**{names(closers)}** — {closer_count} sales',inline=False)
     e.add_field(name='📄 Most Bills',value=f'**{names(bill_winners)}** — {bill_count}',inline=True)
     e.add_field(name='⚡ Most Same Days',value=f'**{names(sd_winners)}** — {sd_count}',inline=True)
@@ -710,6 +710,289 @@ async def refresh_streaks(guild):
             await announce_badge_milestone(guild,uid,'🧊 Ice Cold')
 
 
+
+def week_user_total(g,wk,user_id,stat):
+    start_date,end_date=week_date_bounds_from_key(wk)
+    return period_total_for_user(g,user_id,stat,start_date,end_date)
+
+def setter_king_winners(g,wk):
+    # Setter King:
+    # 1) Most setter sales
+    # 2) If tied, most appointments
+    # 3) If still tied, most badge points
+    # 4) If still tied, share the crown
+    start_date,end_date=week_date_bounds_from_key(wk)
+
+    c=con()
+    user_ids={r['setter_id'] for r in c.execute(
+        'SELECT DISTINCT setter_id FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (g,start_date,end_date)
+    ).fetchall()}
+    user_ids.update(r['setter_id'] for r in c.execute(
+        'SELECT DISTINCT setter_id FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (g,start_date,end_date)
+    ).fetchall())
+    user_ids.update(r['user_id'] for r in c.execute(
+        'SELECT DISTINCT user_id FROM stat_adjustments WHERE guild_id=? AND local_date BETWEEN ? AND ? AND stat_name IN (?,?)',
+        (g,start_date,end_date,'sales','appointments')
+    ).fetchall())
+    c.close()
+
+    rows=[]
+    for uid in user_ids:
+        sales=period_total_for_user(g,uid,'sales',start_date,end_date)
+        appts=period_total_for_user(g,uid,'appointments',start_date,end_date)
+        if sales>0:
+            rows.append((uid,sales,appts,weekly_badge_points(g,uid,wk)))
+
+    if not rows:
+        return [],0,{},{}
+
+    best_sales=max(r[1] for r in rows)
+    tied=[r for r in rows if r[1]==best_sales]
+
+    best_appts=max(r[2] for r in tied)
+    tied=[r for r in tied if r[2]==best_appts]
+
+    best_points=max(r[3] for r in tied)
+    winners=[r[0] for r in tied if r[3]==best_points]
+
+    appt_map={r[0]:r[2] for r in rows}
+    point_map={r[0]:r[3] for r in rows}
+    return winners,best_sales,appt_map,point_map
+
+def month_bounds_for_date(d):
+    start=d.replace(day=1)
+    if start.month==12:
+        next_month=start.replace(year=start.year+1,month=1,day=1)
+    else:
+        next_month=start.replace(month=start.month+1,day=1)
+    end=next_month-timedelta(days=1)
+    return start.isoformat(),end.isoformat()
+
+def period_rows_between(guild_id,start,end,kind,limit=10):
+    c=con(); totals={}
+    if kind=='appointments':
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',
+            (guild_id,start,end)
+        ).fetchall(); stat='appointments'
+    elif kind=='setter_sales':
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM sale_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY setter_id',
+            (guild_id,start,end)
+        ).fetchall(); stat='sales'
+    elif kind=='closer_sales':
+        rows=c.execute(
+            'SELECT closer_id user_id,COUNT(*) value FROM sale_events '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ? AND closer_id>0 GROUP BY closer_id',
+            (guild_id,start,end)
+        ).fetchall(); stat='closer_sales'
+    else:
+        c.close(); return []
+
+    for r in rows:
+        totals[r['user_id']]=float(r['value'] or 0)
+
+    adj=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
+        'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ? GROUP BY user_id',
+        (guild_id,stat,start,end)
+    ).fetchall()
+    c.close()
+
+    for r in adj:
+        totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+
+    data=sorted(
+        ((uid,val) for uid,val in totals.items() if val>0),
+        key=lambda x:(-x[1],x[0])
+    )[:limit]
+    return [{'user_id':uid,'value':int(val) if float(val).is_integer() else val} for uid,val in data]
+
+def team_period_total(g,start,end,kind):
+    c=con()
+    if kind=='appointments':
+        base=c.execute(
+            'SELECT COUNT(*) c FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['c']
+        adj=c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
+            'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
+            (g,'appointments',start,end)
+        ).fetchone()['v']
+    else:
+        base=c.execute(
+            'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['c']
+        adj=c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM team_sale_adjustments '
+            'WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+            (g,start,end)
+        ).fetchone()['v']
+    c.close()
+    return max(0,int((base or 0)+(adj or 0)))
+
+def fmt_ranked_members(guild,rows,limit=5):
+    if not rows:
+        return 'No stats.'
+    lines=[]
+    for i,r in enumerate(rows[:limit],1):
+        member=guild.get_member(r['user_id'])
+        name=member.display_name if member else f'<@{r["user_id"]}>'
+        lines.append(f'**#{i} {name}** — {r["value"]}')
+    return '\n'.join(lines)
+
+def week_member_totals(guild,wk,stat):
+    start,end=week_date_bounds_from_key(wk)
+    out={}
+    for member in guild.members:
+        if member.bot:
+            continue
+        value=period_total_for_user(guild.id,member.id,stat,start,end)
+        if value>0:
+            out[member.id]=value
+    return out
+
+async def send_weekly_manager_summary(guild,week_key):
+    if meta_get(guild.id,'manager_weekly_sent')==week_key:
+        return
+
+    start,end=week_date_bounds_from_key(week_key)
+    prev_end=datetime.strptime(start,'%Y-%m-%d').date()-timedelta(days=1)
+    prev_wk=wkey(prev_end)
+
+    appts=team_week_total(guild.id,week_key,'appointments')
+    sales=team_week_total(guild.id,week_key,'sales')
+
+    top_appts=period_rows_between(guild.id,start,end,'appointments',5)
+    top_setter_sales=period_rows_between(guild.id,start,end,'setter_sales',5)
+    top_closer_sales=period_rows_between(guild.id,start,end,'closer_sales',5)
+
+    # Week-over-week appointment movement.
+    current=week_member_totals(guild,week_key,'appointments')
+    previous=week_member_totals(guild,prev_wk,'appointments')
+    movers=[]
+    for uid in set(current)|set(previous):
+        diff=current.get(uid,0)-previous.get(uid,0)
+        if diff!=0:
+            movers.append((uid,diff,current.get(uid,0),previous.get(uid,0)))
+    movers.sort(key=lambda x:(-x[1],-x[2]))
+
+    momentum=[]
+    for uid,diff,cur,prev in movers[:5]:
+        member=guild.get_member(uid)
+        if not member:
+            continue
+        arrow='⬆️' if diff>0 else '⬇️'
+        momentum.append(f'{arrow} **{member.display_name}**: {prev} → {cur} ({diff:+d})')
+    momentum_text='\n'.join(momentum) if momentum else 'No meaningful week-over-week changes.'
+
+    # Low appointment activity only for members who currently have the Setter role.
+    needs=[]
+    for member in guild.members:
+        if member.bot:
+            continue
+        if not any(r.name.lower()=='setter' for r in member.roles):
+            continue
+        val=period_total_for_user(guild.id,member.id,'appointments',start,end)
+        if val<=1:
+            needs.append((member.display_name,val))
+    needs.sort(key=lambda x:(x[1],x[0].lower()))
+    needs_text='\n'.join(f'• **{name}** — {val} appointment{"s" if val!=1 else ""}' for name,val in needs[:8]) or 'No setters at 0–1 appointments.'
+
+    c=con()
+    pb_count=c.execute(
+        'SELECT COUNT(*) c FROM record_events WHERE guild_id=? AND week_key=?',
+        (guild.id,week_key)
+    ).fetchone()['c']
+    badge_start,badge_end=week_date_bounds_from_key(week_key)
+    badge_count=c.execute(
+        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? '
+        'AND (award_key=? OR award_key BETWEEN ? AND ?)',
+        (guild.id,week_key,badge_start,badge_end)
+    ).fetchone()['c']
+    c.close()
+
+    e=discord.Embed(
+        title='📋 CHOSEN GENESIS — WEEKLY MANAGER REPORT',
+        description=f'Private manager report for **{week_key}**.',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(
+        name='TEAM',
+        value=f'📅 Appointments: **{appts}**\n💰 Sales: **{sales}**\n🏅 Badges Earned: **{int(badge_count or 0)}**\n📈 Personal Bests: **{int(pb_count or 0)}**',
+        inline=False
+    )
+    e.add_field(name='📅 TOP 5 APPOINTMENTS',value=fmt_ranked_members(guild,top_appts),inline=False)
+    e.add_field(name='💰 TOP 5 SETTER SALES',value=fmt_ranked_members(guild,top_setter_sales),inline=False)
+    e.add_field(name='🤝 TOP 5 CLOSER SALES',value=fmt_ranked_members(guild,top_closer_sales),inline=False)
+    e.add_field(name='📈 WEEK-OVER-WEEK MOMENTUM',value=momentum_text,inline=False)
+    e.add_field(name='⚠️ LOW SETTER ACTIVITY',value=needs_text,inline=False)
+    e.set_footer(text='Private manager report • Chosen Genesis')
+
+    managers=[
+        m for m in guild.members
+        if not m.bot and any(r.name.lower()=='manager' for r in m.roles)
+    ]
+    for manager in managers:
+        try:
+            await manager.send(embed=e)
+        except (discord.Forbidden,discord.HTTPException):
+            pass
+
+    meta_set(guild.id,'manager_weekly_sent',week_key)
+
+async def monthly_recap(guild,month_date):
+    start,end=month_bounds_for_date(month_date)
+    month_key=month_date.strftime('%Y-%m')
+    if meta_get(guild.id,'monthly_recap_posted')==month_key:
+        return
+
+    appts=team_period_total(guild.id,start,end,'appointments')
+    sales=team_period_total(guild.id,start,end,'sales')
+    top_setters=period_rows_between(guild.id,start,end,'setter_sales',5)
+    top_closers=period_rows_between(guild.id,start,end,'closer_sales',5)
+    top_appts=period_rows_between(guild.id,start,end,'appointments',5)
+
+    c=con()
+    badge_count=c.execute(
+        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? AND award_key BETWEEN ? AND ?',
+        (guild.id,start,end)
+    ).fetchone()['c']
+    pb_count=c.execute(
+        'SELECT COUNT(*) c FROM record_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild.id,start,end)
+    ).fetchone()['c']
+    c.close()
+
+    e=discord.Embed(
+        title=f'🏆 CHOSEN GENESIS — {month_date.strftime("%B").upper()} RECAP',
+        description=f'**{month_date.strftime("%B %Y")} is officially in the books.**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='📅 Total Appointments',value=f'**{appts}**',inline=True)
+    e.add_field(name='💰 Total Sales',value=f'**{sales}**',inline=True)
+    e.add_field(name='🔥 Personal Bests',value=f'**{int(pb_count or 0)}**',inline=True)
+    e.add_field(name='💰 TOP 5 SETTERS — SALES',value=fmt_ranked_members(guild,top_setters),inline=False)
+    e.add_field(name='🤝 TOP 5 CLOSERS — SALES',value=fmt_ranked_members(guild,top_closers),inline=False)
+    e.add_field(name='📅 TOP 5 APPOINTMENTS',value=fmt_ranked_members(guild,top_appts),inline=False)
+    e.add_field(name='🏅 Badges Earned',value=f'**{int(badge_count or 0)}**',inline=True)
+
+    if sales>=MONTHLY_SALES_GOAL:
+        finish=f'**Chosen Genesis finished at {sales}/{MONTHLY_SALES_GOAL} sales. Goal cleared. 🔥**'
+    else:
+        finish=f'**Chosen Genesis finished at {sales}/{MONTHLY_SALES_GOAL} sales. New month. Run it back.**'
+    e.add_field(name='🎯 MONTHLY GOAL',value=finish,inline=False)
+    e.set_footer(text="New month. Board resets. Who's taking it next?")
+    await main(guild,embed=e)
+    meta_set(guild.id,'monthly_recap_posted',month_key)
+
+
 def weekly_badge_points(g,user_id,wk):
     start_date,end_date=week_date_bounds_from_key(wk)
     c=con()
@@ -727,6 +1010,10 @@ def weekly_badge_points(g,user_id,wk):
     return total
 
 def king_winners(g,wk,kind):
+    if kind=='setter':
+        winners,sales,appt_map,points=setter_king_winners(g,wk)
+        return winners,sales,points
+
     leaders,production=week_winners(g,wk,kind)
     if len(leaders)<=1:
         points={u:weekly_badge_points(g,u,wk) for u in leaders}
@@ -735,8 +1022,6 @@ def king_winners(g,wk,kind):
     points={u:weekly_badge_points(g,u,wk) for u in leaders}
     best=max(points.values()) if points else 0
     winners=[u for u in leaders if points.get(u,0)==best]
-
-    # If badge points are also tied, the remaining tied reps share the crown.
     return winners,production,points
 
 
@@ -754,13 +1039,12 @@ def week_winners(g,wk,kind):
     best=max(totals.values()); return [u for u,v in totals.items() if v==best],best
 
 async def weekly_kings(guild):
-    # Current visible Kings are based on the LAST completed week.
     today=now().date()
     current_week_start=today-timedelta(days=today.weekday())
     prev_week_end=current_week_start-timedelta(days=1)
     wk=wkey(prev_week_end)
 
-    setters,setter_score,setter_points=king_winners(guild.id,wk,'setter')
+    setters,setter_sales,setter_appts,setter_points=setter_king_winners(guild.id,wk)
     closers,closer_score,closer_points=king_winners(guild.id,wk,'closer')
 
     await set_holders(guild,'👑 Setter King',setters)
@@ -781,7 +1065,8 @@ async def weekly_kings(guild):
             title='👑 CHOSEN GENESIS — NEW WEEKLY KINGS',
             description=(
                 'Last week is locked. The crowns are live for this week. 🔥\n\n'
-                '**Tiebreaker:** weekly badge points. If badge points are still tied, the crown is shared.'
+                '**Setter King:** setter sales → appointments → badge points.\n'
+                '**Closer King:** closer sales → badge points.'
             ),
             timestamp=datetime.now(timezone.utc)
         )
@@ -790,19 +1075,19 @@ async def weekly_kings(guild):
             setter_text=[]
             for uid in setters:
                 setter_text.append(
-                    f'<@{uid}> — **{setter_score:g} appointments** • **{setter_points.get(uid,0)} badge pts**'
+                    f'<@{uid}> — **{setter_sales:g} setter sales** • '
+                    f'**{setter_appts.get(uid,0)} appointments** • '
+                    f'**{setter_points.get(uid,0)} badge pts**'
                 )
             setter_value='\n'.join(setter_text)
         else:
             setter_value='No winner'
 
         if closers:
-            closer_text=[]
-            for uid in closers:
-                closer_text.append(
-                    f'<@{uid}> — **{closer_score:g} sales** • **{closer_points.get(uid,0)} badge pts**'
-                )
-            closer_value='\n'.join(closer_text)
+            closer_value='\n'.join(
+                f'<@{uid}> — **{closer_score:g} closer sales** • **{closer_points.get(uid,0)} badge pts**'
+                for uid in closers
+            )
         else:
             closer_value='No winner'
 
@@ -1246,6 +1531,15 @@ async def on_ready():
         await restore_daily(g); await refresh_streaks(g)
     for g in bot.guilds:
         await refresh_leaderboard(g)
+        await weekly_kings(g)
+        if now().weekday()==0:
+            prev=now().date()-timedelta(days=1)
+            prev_wk=wkey(prev)
+            await weekly_recap(g,prev_wk)
+            await send_weekly_manager_summary(g,prev_wk)
+        if now().day==1:
+            prev_month_day=now().date().replace(day=1)-timedelta(days=1)
+            await monthly_recap(g,prev_month_day)
 
 @tasks.loop(minutes=2)
 async def maintenance():
@@ -1258,7 +1552,14 @@ async def maintenance():
         await weekly_kings(g)
         if now().weekday()==0:
             prev=now().date()-timedelta(days=1)
-            await weekly_recap(g,wkey(prev))
+            prev_wk=wkey(prev)
+            await weekly_recap(g,prev_wk)
+            await send_weekly_manager_summary(g,prev_wk)
+
+        # On the first day of a new month, recap the month that just ended.
+        if now().day==1:
+            prev_month_day=now().date().replace(day=1)-timedelta(days=1)
+            await monthly_recap(g,prev_month_day)
 
 @maintenance.before_loop
 async def before_maintenance(): await bot.wait_until_ready()
