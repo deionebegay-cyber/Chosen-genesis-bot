@@ -264,6 +264,11 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id INTEGER,user_id INTEGER,record_name TEXT,value INTEGER,
       local_date TEXT,week_key TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS checkins(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,local_date TEXT,local_time TEXT,
+      photo_url TEXT,photo_filename TEXT,created_at TEXT,
+      UNIQUE(guild_id,user_id,local_date));
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -293,6 +298,32 @@ async def channel(guild,name): return discord.utils.get(guild.text_channels,name
 async def main(guild,content=None,embed=None):
     ch=await channel(guild,'main-chat')
     if ch: await ch.send(content=content,embed=embed)
+
+
+def is_image_attachment(att):
+    content_type=(att.content_type or '').lower()
+    if content_type.startswith('image/'):
+        return True
+    name=(att.filename or '').lower()
+    return name.endswith(('.png','.jpg','.jpeg','.webp','.gif','.heic','.heif'))
+
+def get_today_checkin(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        'SELECT * FROM checkins WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild_id,user_id,dkey())
+    ).fetchone()
+    c.close()
+    return row
+
+def today_checkins(guild_id):
+    c=con()
+    rows=c.execute(
+        'SELECT * FROM checkins WHERE guild_id=? AND local_date=? ORDER BY local_time ASC,id ASC',
+        (guild_id,dkey())
+    ).fetchall()
+    c.close()
+    return rows
 
 def is_manager(member):
     return isinstance(member, discord.Member) and any(r.name.lower() == 'manager' for r in member.roles)
@@ -2102,6 +2133,131 @@ async def dailyawards(interaction:discord.Interaction):
             '⚠️ I found **0 appointments and 0 sales** for today, so there was nothing to post.',
             ephemeral=True
         )
+
+
+@bot.tree.command(name='checkin',description='Check in for the day with a required photo')
+@app_commands.describe(photo='Upload your check-in photo')
+async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            'Use this command inside the server.',
+            ephemeral=True
+        )
+
+    if not is_image_attachment(photo):
+        return await interaction.response.send_message(
+            '❌ Your check-in must include an image/photo.',
+            ephemeral=True
+        )
+
+    existing=get_today_checkin(interaction.guild.id,interaction.user.id)
+    if existing:
+        return await interaction.response.send_message(
+            f'✅ You already checked in today at **{existing["local_time"]}**.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    n=now()
+    local_date=n.date().isoformat()
+    local_time=n.strftime('%-I:%M %p')
+
+    c=con()
+    try:
+        c.execute(
+            'INSERT INTO checkins(guild_id,user_id,local_date,local_time,photo_url,photo_filename,created_at) '
+            'VALUES(?,?,?,?,?,?,?)',
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                local_date,
+                local_time,
+                photo.url,
+                photo.filename,
+                datetime.now(timezone.utc).isoformat()
+            )
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close()
+        return await interaction.followup.send(
+            '✅ You already checked in today.',
+            ephemeral=True
+        )
+    c.close()
+
+    e=discord.Embed(
+        title='📸 CHOSEN GENESIS — CHECK IN',
+        description=(
+            f'🫡 **{interaction.user.mention} checked in**\n'
+            f'🕐 **{local_time}**\n\n'
+            '**Locked in. Let’s work. 🔥**'
+        ),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_image(url=photo.url)
+    e.set_footer(text='Chosen Genesis')
+
+    await main(interaction.guild,embed=e)
+    await interaction.followup.send(
+        f'✅ Check-in recorded for **{local_time}**.',
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name='checkins',description='Manager-only: see today’s setter check-ins')
+async def checkins(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            'Use this command inside the server.',
+            ephemeral=True
+        )
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    rows=today_checkins(interaction.guild.id)
+    by_user={r['user_id']:r for r in rows}
+
+    setters=[
+        m for m in interaction.guild.members
+        if not m.bot and any(r.name.lower()=='setter' for r in m.roles)
+    ]
+
+    checked=[]
+    missing=[]
+    for member in setters:
+        row=by_user.get(member.id)
+        if row:
+            checked.append((row['local_time'],member.display_name))
+        else:
+            missing.append(member.display_name)
+
+    checked_text='\n'.join(
+        f'✅ **{name}** — {time_text}'
+        for time_text,name in checked
+    ) or 'No setters checked in yet.'
+
+    missing_text='\n'.join(
+        f'❌ **{name}**'
+        for name in sorted(missing,key=str.lower)
+    ) or 'Everyone is checked in. 🔥'
+
+    e=discord.Embed(
+        title='📋 CHOSEN GENESIS — TODAY’S CHECK-INS',
+        description=f'**{now().strftime("%A, %B %d")}**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='✅ CHECKED IN',value=checked_text,inline=False)
+    e.add_field(name='❌ NOT CHECKED IN',value=missing_text,inline=False)
+    e.set_footer(text='Manager view • Chosen Genesis')
+
+    await interaction.followup.send(embed=e,ephemeral=True)
 
 
 @bot.tree.command(name='appointment',description='Log a new appointment')
