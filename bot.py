@@ -2371,6 +2371,130 @@ async def mystats(interaction:discord.Interaction):
     await interaction.response.send_message(embed=e,ephemeral=True)
 
 
+@bot.tree.command(name='stats',description='Privately view another member’s Chosen Genesis stats')
+@app_commands.describe(member='Whose stats do you want to view?')
+async def stats(interaction:discord.Interaction,member:discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            'Use this command inside the server.',
+            ephemeral=True
+        )
+
+    # Keep lookups private so the server chat does not get flooded with stat cards.
+    await interaction.response.defer(ephemeral=True)
+
+    today=now().date().isoformat()
+    wstart,wend=current_week_bounds()
+    mstart,mend=current_month_bounds()
+    ystart,yend=current_year_bounds()
+
+    today_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',today,today)
+    week_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',wstart,wend)
+    month_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',mstart,mend)
+    year_appts=period_total_for_user(interaction.guild.id,member.id,'appointments',ystart,yend)
+
+    week_setter=period_total_for_user(interaction.guild.id,member.id,'sales',wstart,wend)
+    month_setter=period_total_for_user(interaction.guild.id,member.id,'sales',mstart,mend)
+    year_setter=period_total_for_user(interaction.guild.id,member.id,'sales',ystart,yend)
+
+    week_closer=period_total_for_user(interaction.guild.id,member.id,'closer_sales',wstart,wend)
+    month_closer=period_total_for_user(interaction.guild.id,member.id,'closer_sales',mstart,mend)
+    year_closer=period_total_for_user(interaction.guild.id,member.id,'closer_sales',ystart,yend)
+
+    c=con()
+    saved=c.execute(
+        'SELECT * FROM stats WHERE guild_id=? AND user_id=?',
+        (interaction.guild.id,member.id)
+    ).fetchone()
+
+    records=c.execute(
+        'SELECT record_name,best_value FROM personal_records WHERE guild_id=? AND user_id=?',
+        (interaction.guild.id,member.id)
+    ).fetchall()
+    c.close()
+
+    all_appts=int(saved['appointments']) if saved else 0
+    all_setter=int(saved['sales']) if saved else 0
+    all_closer=int(saved['closer_sales']) if saved else 0
+
+    counts=badge_counts(interaction.guild.id,member.id)
+
+    badge_lines=[]
+    for badge in DAILY+STREAK+WEEKLY:
+        count=counts.get(badge,0)
+        if count:
+            badge_lines.append(f'**{badge} ×{count}**')
+    badges_text='\n'.join(badge_lines) if badge_lines else 'No badges earned yet.'
+
+    record_map={r['record_name']:int(r['best_value'] or 0) for r in records}
+    best_day=record_map.get('daily_appointments',0)
+    best_setter_sales=record_map.get('daily_setter_sales',0)
+    best_closer_sales=record_map.get('daily_closer_sales',0)
+
+    record_lines=[]
+    if best_day:
+        record_lines.append(f'📅 Best Appointment Day: **{best_day}**')
+    if best_setter_sales:
+        record_lines.append(f'💰 Best Setter Sales Day: **{best_setter_sales}**')
+    if best_closer_sales:
+        record_lines.append(f'🤝 Best Closer Sales Day: **{best_closer_sales}**')
+    records_text='\n'.join(record_lines) if record_lines else 'No personal records yet.'
+
+    e=discord.Embed(
+        title=f'📊 {member.display_name.upper()} — STATS',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(
+        name='📅 APPOINTMENTS',
+        value=(
+            f'Today: **{today_appts}**\n'
+            f'This Week: **{week_appts}**\n'
+            f'This Month: **{month_appts}**\n'
+            f'This Year: **{year_appts}**'
+        ),
+        inline=False
+    )
+    e.add_field(
+        name='💰 SETTER SALES',
+        value=(
+            f'This Week: **{week_setter}**\n'
+            f'This Month: **{month_setter}**\n'
+            f'This Year: **{year_setter}**'
+        ),
+        inline=True
+    )
+    e.add_field(
+        name='🤝 CLOSER SALES',
+        value=(
+            f'This Week: **{week_closer}**\n'
+            f'This Month: **{month_closer}**\n'
+            f'This Year: **{year_closer}**'
+        ),
+        inline=True
+    )
+    e.add_field(
+        name='🏅 BADGES',
+        value=badges_text,
+        inline=False
+    )
+    e.add_field(
+        name='🏆 PERSONAL RECORDS',
+        value=records_text,
+        inline=False
+    )
+    e.add_field(
+        name='📊 ALL-TIME',
+        value=(
+            f'Appointments: **{all_appts}**\n'
+            f'Setter Sales: **{all_setter}**\n'
+            f'Closer Sales: **{all_closer}**'
+        ),
+        inline=False
+    )
+    e.set_footer(text='Private lookup — only you can see this.')
+    await interaction.followup.send(embed=e,ephemeral=True)
+
+
 @bot.tree.command(name='badgeguide',description='See every Chosen Genesis badge and what it means')
 async def badgeguide(interaction:discord.Interaction):
     e=discord.Embed(
