@@ -10,6 +10,18 @@ DATA_PATH=os.getenv('DATA_PATH','genesis.db')
 GUILD_ID=os.getenv('GUILD_ID')
 TZ=ZoneInfo('America/Phoenix')
 
+# Setter check-in standards.
+# Regular setters: 10:00 AM target with a 20-minute grace period.
+# Earned Freedom: 4+ setter deals in the PREVIOUS month allows check-in through
+# 11:35 AM (11:30 target + 5-minute grace) for the entire current month.
+REGULAR_CHECKIN_HOUR=10
+REGULAR_CHECKIN_MINUTE=0
+REGULAR_GRACE_MINUTES=20
+FREEDOM_REQUIRED_DEALS=4
+FREEDOM_CUTOFF_HOUR=11
+FREEDOM_CUTOFF_MINUTE=30
+FREEDOM_GRACE_MINUTES=5
+
 DAILY=['🩸 First Blood','🦉 Night Owl','👻 Ghost Hunter','🎯 Point Man','📄 Bounty Hunter','⚡ Same Day Savage','⏰ Speed Demon','💥 Sale','🥈 2 Spot','🎩 Hattrick']
 STREAK=['🔥 Hot Streak','🧊 Ice Cold']
 WEEKLY=['👑 Setter King','👑 Closer King']
@@ -324,6 +336,53 @@ def today_checkins(guild_id):
     ).fetchall()
     c.close()
     return rows
+
+def previous_month_bounds(d=None):
+    d=d or now().date()
+    first=d.replace(day=1)
+    prev_end=first-timedelta(days=1)
+    prev_start=prev_end.replace(day=1)
+    return prev_start.isoformat(),prev_end.isoformat()
+
+def previous_month_setter_deals(guild_id,user_id):
+    start,end=previous_month_bounds()
+    return period_total_for_user(guild_id,user_id,'sales',start,end)
+
+def has_earned_freedom(guild_id,user_id):
+    return previous_month_setter_deals(guild_id,user_id) >= FREEDOM_REQUIRED_DEALS
+
+def minutes_since_midnight(hour,minute):
+    return hour*60+minute
+
+def checkin_status_for_member(guild,member,checkin_dt):
+    is_setter=any(r.name.lower()=='setter' for r in member.roles)
+    if not is_setter:
+        return 'not_applicable',None,None
+
+    actual=minutes_since_midnight(checkin_dt.hour,checkin_dt.minute)
+
+    if has_earned_freedom(guild.id,member.id):
+        cutoff=minutes_since_midnight(FREEDOM_CUTOFF_HOUR,FREEDOM_CUTOFF_MINUTE)
+        final_cutoff=cutoff+FREEDOM_GRACE_MINUTES
+        if actual<=cutoff:
+            return 'freedom',cutoff,final_cutoff
+        if actual<=final_cutoff:
+            return 'freedom_grace',cutoff,final_cutoff
+        return 'late',cutoff,final_cutoff
+
+    cutoff=minutes_since_midnight(REGULAR_CHECKIN_HOUR,REGULAR_CHECKIN_MINUTE)
+    final_cutoff=cutoff+REGULAR_GRACE_MINUTES
+    if actual<=cutoff:
+        return 'on_time',cutoff,final_cutoff
+    if actual<=final_cutoff:
+        return 'grace',cutoff,final_cutoff
+    return 'late',cutoff,final_cutoff
+
+def parse_checkin_local_datetime(row):
+    return datetime.strptime(
+        f"{row['local_date']} {row['local_time']}",
+        '%Y-%m-%d %I:%M %p'
+    )
 
 def is_manager(member):
     return isinstance(member, discord.Member) and any(r.name.lower() == 'manager' for r in member.roles)
@@ -1300,6 +1359,45 @@ async def send_weekly_manager_summary(guild,week_key):
     e.add_field(name='🤝 TOP 5 CLOSER SALES',value=fmt_ranked_members(guild,top_closer_sales),inline=False)
     e.add_field(name='📈 WEEK-OVER-WEEK MOMENTUM',value=momentum_text,inline=False)
     e.add_field(name='⚠️ LOW SETTER ACTIVITY',value=needs_text,inline=False)
+
+    c=con()
+    check_rows=c.execute(
+        'SELECT user_id,local_date,local_time FROM checkins '
+        'WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild.id,start,end)
+    ).fetchall()
+    c.close()
+
+    late_counts={}
+    freedom_counts={}
+    for r in check_rows:
+        member=guild.get_member(r['user_id'])
+        if not member or not any(role.name.lower()=='setter' for role in member.roles):
+            continue
+        try:
+            dt=datetime.strptime(f"{r['local_date']} {r['local_time']}",'%Y-%m-%d %I:%M %p')
+        except ValueError:
+            continue
+        status,_,_=checkin_status_for_member(guild,member,dt)
+        if status=='late':
+            late_counts[member.id]=late_counts.get(member.id,0)+1
+        elif status in {'freedom','freedom_grace'}:
+            freedom_counts[member.id]=freedom_counts.get(member.id,0)+1
+
+    attendance_lines=[]
+    for uid,count in sorted(late_counts.items(),key=lambda x:(-x[1],x[0])):
+        m=guild.get_member(uid)
+        if m:
+            attendance_lines.append(f'⚠️ **{m.display_name}** — {count} late check-in{"s" if count!=1 else ""}')
+    if freedom_counts:
+        total_freedom=sum(freedom_counts.values())
+        attendance_lines.append(f'🔓 Earned Freedom check-ins: **{total_freedom}**')
+
+    e.add_field(
+        name='🕐 CHECK-IN ACCOUNTABILITY',
+        value='\n'.join(attendance_lines) if attendance_lines else 'No late setter check-ins recorded.',
+        inline=False
+    )
     e.set_footer(text='Private manager report • Chosen Genesis')
 
     managers=[
@@ -2187,11 +2285,18 @@ async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
         )
     c.close()
 
+    status,_,_=checkin_status_for_member(interaction.guild,interaction.user,n.replace(tzinfo=None))
+    freedom_line=''
+    if status in {'freedom','freedom_grace'}:
+        deals=previous_month_setter_deals(interaction.guild.id,interaction.user.id)
+        freedom_line=f'\n🔓 **Earned Freedom — {deals} deals last month**'
+
     e=discord.Embed(
         title='📸 CHOSEN GENESIS — CHECK IN',
         description=(
             f'🫡 **{interaction.user.mention} checked in**\n'
-            f'🕐 **{local_time}**\n\n'
+            f'🕐 **{local_time}**'
+            f'{freedom_line}\n\n'
             '**Locked in. Let’s work. 🔥**'
         ),
         timestamp=datetime.now(timezone.utc)
@@ -2229,35 +2334,77 @@ async def checkins(interaction:discord.Interaction):
         if not m.bot and any(r.name.lower()=='setter' for r in m.roles)
     ]
 
-    checked=[]
+    on_time=[]
+    grace=[]
+    freedom=[]
+    late=[]
     missing=[]
+
     for member in setters:
         row=by_user.get(member.id)
-        if row:
-            checked.append((row['local_time'],member.display_name))
-        else:
+        if not row:
             missing.append(member.display_name)
+            continue
 
-    checked_text='\n'.join(
-        f'✅ **{name}** — {time_text}'
-        for time_text,name in checked
-    ) or 'No setters checked in yet.'
+        dt=parse_checkin_local_datetime(row)
+        status,_,_=checkin_status_for_member(interaction.guild,member,dt)
+        line=f'**{member.display_name}** — {row["local_time"]}'
 
-    missing_text='\n'.join(
-        f'❌ **{name}**'
-        for name in sorted(missing,key=str.lower)
-    ) or 'Everyone is checked in. 🔥'
+        if status=='on_time':
+            on_time.append(line)
+        elif status=='grace':
+            grace.append(line)
+        elif status in {'freedom','freedom_grace'}:
+            deals=previous_month_setter_deals(interaction.guild.id,member.id)
+            suffix=' (grace)' if status=='freedom_grace' else ''
+            freedom.append(f'{line} — {deals} deals last month{suffix}')
+        elif status=='late':
+            late.append(line)
 
     e=discord.Embed(
-        title='📋 CHOSEN GENESIS — TODAY’S CHECK-INS',
-        description=f'**{now().strftime("%A, %B %d")}**',
+        title='📋 CHOSEN GENESIS — TODAY’S SETTER CHECK-INS',
+        description=(
+            f'**{now().strftime("%A, %B %d")}**\\n'
+            f'Regular target: **10:00 AM** • grace through **10:20 AM**\\n'
+            f'Earned Freedom: **4+ setter deals last month** • target **11:30 AM** • grace through **11:35 AM**'
+        ),
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name='✅ CHECKED IN',value=checked_text,inline=False)
-    e.add_field(name='❌ NOT CHECKED IN',value=missing_text,inline=False)
-    e.set_footer(text='Manager view • Chosen Genesis')
 
+    e.add_field(
+        name='✅ ON TIME',
+        value='\\n'.join(f'✅ {x}' for x in on_time) or 'None',
+        inline=False
+    )
+    if grace:
+        e.add_field(
+            name='🟡 WITHIN GRACE',
+            value='\\n'.join(f'🟡 {x}' for x in grace),
+            inline=False
+        )
+    if freedom:
+        e.add_field(
+            name='🔓 EARNED FREEDOM',
+            value='\\n'.join(f'🔓 {x}' for x in freedom),
+            inline=False
+        )
+    if late:
+        e.add_field(
+            name='⚠️ LATE',
+            value='\\n'.join(f'⚠️ {x}' for x in late),
+            inline=False
+        )
+
+    e.add_field(
+        name='❌ NOT CHECKED IN',
+        value='\\n'.join(f'❌ **{name}**' for name in sorted(missing,key=str.lower)) or 'Everyone is checked in. 🔥',
+        inline=False
+    )
+
+    e.set_footer(text='Private manager view • Chosen Genesis')
     await interaction.followup.send(embed=e,ephemeral=True)
+
+
 
 
 @bot.tree.command(name='appointment',description='Log a new appointment')
