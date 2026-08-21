@@ -1938,48 +1938,144 @@ async def before_maintenance(): await bot.wait_until_ready()
 
 MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
 
-@bot.tree.command(name='givebadge',description='Manager-only: manually award a badge')
-@app_commands.describe(member='Who gets the badge',badge='Badge to award',announce='Announce it in main chat?')
+@bot.tree.command(name='givebadge',description='Manager-only: add a badge to someone’s history/count')
+@app_commands.describe(
+    member='Who gets the badge',
+    badge='Badge to give',
+    announce='Announce the manual award?'
+)
 @app_commands.choices(badge=MANUAL_BADGE_CHOICES)
-async def givebadge(interaction:discord.Interaction,member:discord.Member,badge:app_commands.Choice[str],announce:bool=True):
+async def givebadge(
+    interaction:discord.Interaction,
+    member:discord.Member,
+    badge:app_commands.Choice[str],
+    announce:bool=True
+):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     if not is_manager(interaction.user):
-        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    # Acknowledge immediately so Discord never times the command out.
+    await interaction.response.defer(ephemeral=True)
+
     badge_name=badge.value
     manual_key=f'manual:{dkey()}:{interaction.id}'
-    award_badge_count(interaction.guild.id,member.id,badge_name,manual_key)
-    await add_role(interaction.guild,member,badge_name)
-    await announce_badge_milestone(interaction.guild,member.id,badge_name)
-    await refresh_leaderboard(interaction.guild)
-    await interaction.response.send_message(f'✅ Gave **{badge_name}** to {member.mention}. Badge history/count updated.',ephemeral=True)
-    if announce:
-        await main(interaction.guild,content=f'🏅 **MANAGER BADGE AWARD** — {member.mention} earned **{badge_name}**!')
 
-@bot.tree.command(name='removebadge',description='Manager-only: remove one badge award')
-@app_commands.describe(member='Who loses the badge',badge='Badge to remove',announce='Announce the correction?')
+    added=award_badge_count(
+        interaction.guild.id,
+        member.id,
+        badge_name,
+        manual_key
+    )
+
+    if not added:
+        return await interaction.followup.send(
+            f'⚠️ That manual **{badge_name}** award was already recorded.',
+            ephemeral=True
+        )
+
+    # IMPORTANT:
+    # Manual awards are history/count only. Do NOT assign the Discord badge role.
+    # Live roles are reserved for the actual daily/weekly winners so manually
+    # correcting someone's badge count cannot change the leaderboard.
+    await announce_badge_milestone(
+        interaction.guild,
+        member.id,
+        badge_name
+    )
+
+    await interaction.followup.send(
+        f'✅ Added **{badge_name}** to {member.mention}’s badge history/count.\n'
+        f'It **will not change the live daily leaderboard**.',
+        ephemeral=True
+    )
+
+    if announce:
+        await main(
+            interaction.guild,
+            content=f'🏅 **MANAGER BADGE AWARD** — {member.mention} earned **{badge_name}**!'
+        )
+
+
+@bot.tree.command(name='removebadge',description='Manager-only: remove one recorded badge award')
+@app_commands.describe(
+    member='Who loses one recorded badge',
+    badge='Badge to remove',
+    announce='Announce the correction?'
+)
 @app_commands.choices(badge=MANUAL_BADGE_CHOICES)
-async def removebadge(interaction:discord.Interaction,member:discord.Member,badge:app_commands.Choice[str],announce:bool=False):
+async def removebadge(
+    interaction:discord.Interaction,
+    member:discord.Member,
+    badge:app_commands.Choice[str],
+    announce:bool=False
+):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     if not is_manager(interaction.user):
-        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    # Defer first. The old command refreshed the leaderboard before responding,
+    # which could exceed Discord's interaction timeout and show
+    # "Application did not respond."
+    await interaction.response.defer(ephemeral=True)
+
     badge_name=badge.value
-    c=con(); row=c.execute('SELECT rowid FROM badge_awards WHERE guild_id=? AND user_id=? AND badge_name=? ORDER BY created_at DESC,rowid DESC LIMIT 1',(interaction.guild.id,member.id,badge_name)).fetchone()
+    c=con()
+
+    # Prefer removing a manual award first. If there is no manual correction,
+    # remove the most recent recorded award for that badge.
+    row=c.execute(
+        'SELECT rowid,award_key FROM badge_awards '
+        'WHERE guild_id=? AND user_id=? AND badge_name=? '
+        'ORDER BY CASE WHEN award_key LIKE ? THEN 0 ELSE 1 END, '
+        'created_at DESC,rowid DESC LIMIT 1',
+        (
+            interaction.guild.id,
+            member.id,
+            badge_name,
+            'manual:%'
+        )
+    ).fetchone()
+
     if row:
-        c.execute('DELETE FROM badge_awards WHERE rowid=?',(row['rowid'],)); c.commit()
+        c.execute('DELETE FROM badge_awards WHERE rowid=?',(row['rowid'],))
+        c.commit()
     c.close()
+
     if not row:
-        return await interaction.response.send_message(f'⚠️ No recorded **{badge_name}** award found for {member.mention}.',ephemeral=True)
-    if badge_count_for(interaction.guild.id,member.id,badge_name)==0:
-        r=discord.utils.get(interaction.guild.roles,name=badge_name)
-        if r and r in member.roles:
-            try: await member.remove_roles(r,reason='Manager removed badge award')
-            except discord.Forbidden: pass
-    await refresh_leaderboard(interaction.guild)
-    await interaction.response.send_message(f'✅ Removed one **{badge_name}** award from {member.mention}.',ephemeral=True)
+        return await interaction.followup.send(
+            f'⚠️ No recorded **{badge_name}** award found for {member.mention}.',
+            ephemeral=True
+        )
+
+    # Do NOT remove the Discord role here. Live badge roles are controlled by
+    # the automatic daily/weekly competition system, not manual history edits.
+    remaining=badge_count_for(
+        interaction.guild.id,
+        member.id,
+        badge_name
+    )
+
+    await interaction.followup.send(
+        f'✅ Removed one recorded **{badge_name}** from {member.mention}.\n'
+        f'Remaining count: **{remaining}**. The live leaderboard was not changed.',
+        ephemeral=True
+    )
+
     if announce:
-        await main(interaction.guild,content=f'🛠️ **BADGE CORRECTION** — one **{badge_name}** award was removed from {member.mention}.')
+        await main(
+            interaction.guild,
+            content=f'🛠️ **BADGE CORRECTION** — one **{badge_name}** award was removed from {member.mention}.'
+        )
+
 
 
 @bot.tree.command(name='dailyawards',description='Manager-only: post or re-post today’s Daily Awards')
