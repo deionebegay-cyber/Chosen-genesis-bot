@@ -18,7 +18,7 @@ BADGE_DESCRIPTIONS = {
     '🩸 First Blood':'First appointment of the day.',
     '🦉 Night Owl':'Last appointment of the evening.',
     '👻 Ghost Hunter':'Sale after 7 PM.',
-    '🎯 Point Man':'Most appointments that day.',
+    '🎯 Point Man':'One daily winner. Minimum 2 appointments; quality breaks ties.',
     '📄 Bounty Hunter':'Most bills collected that day.',
     '⚡ Same Day Savage':'Most same-day appointments that day.',
     '⏰ Speed Demon':'Most appointments within 48 hours that day.',
@@ -71,6 +71,20 @@ WELCOME_MESSAGES = [
     ("👀 WHO LET THIS GUY IN?", "Welcome {mention} to **Chosen Genesis** 😂🔥\n\n**Team, show some love.**"),
     ("🔥 WELCOME TO CHOSEN GENESIS", "{mention} is officially in.\n\n**Drop a 🫡 and welcome them to the team.**"),
     ("⚔️ ANOTHER ONE JOINS THE RANKS", "{mention}, welcome to **Chosen Genesis**.\n\nNew name. Fresh board. Let's work. 🔥"),
+]
+
+
+DAILY_AWARD_CLOSERS = [
+    "Another day in the books. **Who's taking the badges tomorrow? 👀**",
+    "Clock's out. Results are in. **Tomorrow the board goes back up for grabs. 🔥**",
+    "That's a wrap for **Chosen Genesis**. Crowns earned. Badges claimed. **Run it back tomorrow. 🫡**",
+    "The doors are closed. **The scoreboard isn't lying.** See y'all tomorrow. 😈",
+    "Today's winners are official. **Enjoy it tonight — tomorrow nobody cares. 😂🔥**",
+    "Badges locked. Bragging rights secured. **Tomorrow we start from zero.**",
+    "**Chosen Genesis** clocked out with **{sales} sales** and **{appointments} appointments**. Who's coming for the board tomorrow? 👑",
+    "Day complete. Some people earned badges. **Some people earned motivation. 😂**",
+    "The board is final. **Talk your talk tonight — you've got to defend it tomorrow. 👀**",
+    "That's game. Winners enjoy it. **Everybody else knows what time it is tomorrow. 🔥**",
 ]
 
 PRESSURE_COPY = {
@@ -346,25 +360,32 @@ def last_setter_for_date(g,date_text):
     c.close()
     return r['setter_id'] if r else None
 
-async def finalize_night_owl(guild,date_obj):
+async def set_live_night_owl(guild,date_text=None):
+    date_text=date_text or dkey()
+    uid=last_setter_for_date(guild.id,date_text)
+    await set_holders(guild,'🦉 Night Owl',[uid] if uid else [])
+    return uid
+
+async def finalize_night_owl(guild,date_obj,set_role=True):
     date_text=date_obj.isoformat()
     uid=last_setter_for_date(guild.id,date_text)
-    if not uid: return
-    # Historical count is permanent. The role itself represents the latest finalized day.
+    if not uid:
+        return None
     if award_badge_count(guild.id,uid,'🦉 Night Owl',date_text):
         await announce_badge_milestone(guild,uid,'🦉 Night Owl')
-    member=guild.get_member(uid)
-    if member:
+    if set_role:
         await set_holders(guild,'🦉 Night Owl',[uid])
+    return uid
 
 async def finalize_previous_day_badges(guild):
+    # Backup only: if the bot missed 9 PM, preserve yesterday's Night Owl in
+    # badge history without showing yesterday's role throughout the new day.
     yesterday=now().date()-timedelta(days=1)
     key='night_owl_finalized'
     if meta_get(guild.id,key)==yesterday.isoformat():
         return
-    await finalize_night_owl(guild,yesterday)
+    await finalize_night_owl(guild,yesterday,set_role=False)
     meta_set(guild.id,key,yesterday.isoformat())
-
 
 
 BADGE_MILESTONES = {5,10,25,50,100}
@@ -607,6 +628,146 @@ async def weekly_recap(guild,week_key):
     meta_set(guild.id,'weekly_recap_posted',week_key)
 
 
+
+def first_setter_for_date(g,date_text):
+    c=con()
+    r=c.execute(
+        'SELECT setter_id FROM appointment_events WHERE guild_id=? AND local_date=? ORDER BY id ASC LIMIT 1',
+        (g,date_text)
+    ).fetchone()
+    c.close()
+    return r['setter_id'] if r else None
+
+def daily_team_sales(g,date_text):
+    c=con()
+    base=c.execute(
+        'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND local_date=?',
+        (g,date_text)
+    ).fetchone()['c']
+    manual=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM team_sale_adjustments WHERE guild_id=? AND local_date=?',
+        (g,date_text)
+    ).fetchone()['v']
+    c.close()
+    return max(0,int((base or 0)+(manual or 0)))
+
+def daily_team_appointments_for_date(g,date_text):
+    totals=daily_metric_totals_for_date(g,'appointments',date_text)
+    return int(sum(max(0,v) for v in totals.values()))
+
+def sale_badge_holders_for_date(g,date_text,badge):
+    c=con()
+    rows=c.execute(
+        'SELECT DISTINCT user_id FROM badge_awards '
+        'WHERE guild_id=? AND badge_name=? AND award_key=? ORDER BY user_id',
+        (g,badge,date_text)
+    ).fetchall()
+    c.close()
+    return [r['user_id'] for r in rows]
+
+def member_names(guild,ids):
+    names=[]
+    for uid in ids:
+        member=guild.get_member(uid)
+        names.append(member.display_name if member else f'<@{uid}>')
+    return ', '.join(names) if names else 'None'
+
+async def finalize_daily_competitive_badges(guild,date_text):
+    point_uid,point_count,_=point_man_result(guild.id,date_text)
+    if point_uid:
+        await set_holders(guild,'🎯 Point Man',[point_uid])
+        if award_badge_count(guild.id,point_uid,'🎯 Point Man',date_text):
+            await announce_badge_milestone(guild,point_uid,'🎯 Point Man')
+    else:
+        await set_holders(guild,'🎯 Point Man',[])
+
+    final={}
+    for metric,badge in [
+        ('bills','📄 Bounty Hunter'),
+        ('same_day','⚡ Same Day Savage'),
+        ('within_48','⏰ Speed Demon')
+    ]:
+        leaders=daily_leaders_for_date(guild.id,metric,date_text)
+        await set_holders(guild,badge,leaders)
+        for uid in leaders:
+            if award_badge_count(guild.id,uid,badge,date_text):
+                await announce_badge_milestone(guild,uid,badge)
+        totals=daily_metric_totals_for_date(guild.id,metric,date_text)
+        best=max((int(totals.get(uid,0)) for uid in leaders),default=0)
+        final[badge]=(leaders,best)
+
+    return point_uid,point_count,final
+
+async def post_daily_awards(guild):
+    date_text=dkey()
+    key=f'daily_awards_{date_text}'
+    if meta_get(guild.id,key):
+        return
+
+    appointments=daily_team_appointments_for_date(guild.id,date_text)
+    sales=daily_team_sales(guild.id,date_text)
+
+    # Don't post an empty recap on a day nobody worked.
+    if appointments<=0 and sales<=0:
+        meta_set(guild.id,key,'empty')
+        return
+
+    point_uid,point_count,quality_badges=await finalize_daily_competitive_badges(guild,date_text)
+    night_uid=await finalize_night_owl(guild,now().date(),set_role=True)
+    meta_set(guild.id,'night_owl_finalized',date_text)
+
+    first_uid=first_setter_for_date(guild.id,date_text)
+
+    sale_ids=sale_badge_holders_for_date(guild.id,date_text,'💥 Sale')
+    two_ids=sale_badge_holders_for_date(guild.id,date_text,'🥈 2 Spot')
+    hat_ids=sale_badge_holders_for_date(guild.id,date_text,'🎩 Hattrick')
+    ghost_ids=sale_badge_holders_for_date(guild.id,date_text,'👻 Ghost Hunter')
+
+    e=discord.Embed(
+        title='🏆 CHOSEN GENESIS — DAILY AWARDS',
+        description=f'**💰🔥 SALES BOARD — {sales} SALE{"S" if sales!=1 else ""} TODAY**',
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    sales_text=(
+        f'💥 **SALE:** {member_names(guild,sale_ids)}\n'
+        f'🥈 **2 SPOT:** {member_names(guild,two_ids)}\n'
+        f'🎩 **HATTRICK:** {member_names(guild,hat_ids)}\n'
+        f'👻 **GHOST HUNTER:** {member_names(guild,ghost_ids)}'
+    )
+    e.add_field(name='💰 SALES BADGES',value=sales_text,inline=False)
+
+    point_name=member_names(guild,[point_uid]) if point_uid else 'No winner — nobody reached 2 appointments'
+    bounty_ids,bounty_val=quality_badges.get('📄 Bounty Hunter',([],0))
+    same_ids,same_val=quality_badges.get('⚡ Same Day Savage',([],0))
+    speed_ids,speed_val=quality_badges.get('⏰ Speed Demon',([],0))
+
+    comp_text=(
+        f'🎯 **POINT MAN:** {point_name}' + (f' — {point_count} appointments' if point_uid else '') + '\n'
+        f'📄 **BOUNTY HUNTER:** {member_names(guild,bounty_ids)}' + (f' — {bounty_val} bills' if bounty_ids else '') + '\n'
+        f'⚡ **SAME DAY SAVAGE:** {member_names(guild,same_ids)}' + (f' — {same_val} same-days' if same_ids else '') + '\n'
+        f'⏰ **SPEED DEMON:** {member_names(guild,speed_ids)}' + (f' — {speed_val} within 48 hrs' if speed_ids else '') + '\n'
+        f'🩸 **FIRST BLOOD:** {member_names(guild,[first_uid] if first_uid else [])}\n'
+        f'🦉 **NIGHT OWL:** {member_names(guild,[night_uid] if night_uid else [])}'
+    )
+    e.add_field(name='🎯 DAILY BADGES',value=comp_text,inline=False)
+
+    e.add_field(
+        name='📊 CHOSEN GENESIS TODAY',
+        value=f'**{appointments} appointments • {sales} sales**',
+        inline=False
+    )
+
+    closing=random.choice(DAILY_AWARD_CLOSERS).format(
+        sales=sales,
+        appointments=appointments
+    )
+    e.add_field(name='🔥 FINAL WORD',value=closing,inline=False)
+
+    await main(guild,embed=e)
+    meta_set(guild.id,key,'posted')
+    await refresh_leaderboard(guild)
+
 def adjustment_sum(g,u,stat,start_date,end_date):
     c=con(); r=c.execute(
         'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments WHERE guild_id=? AND user_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
@@ -637,40 +798,133 @@ def resolved_edit_date(date_mode,custom_date):
     return today
 
 
-def daily_metric_totals(g,metric):
-    today=dkey(); c=con(); totals={}
+def daily_metric_totals_for_date(g,metric,date_text):
+    c=con(); totals={}
     if metric=='appointments':
-        rows=c.execute('SELECT setter_id user_id,COUNT(*) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
-        stat='appointments'
+        rows=c.execute(
+            'SELECT setter_id user_id,COUNT(*) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,date_text)
+        ).fetchall(); stat='appointments'
     elif metric=='bills':
-        rows=c.execute('SELECT setter_id user_id,SUM(bill_collected) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
-        stat='bills'
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(bill_collected),0) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,date_text)
+        ).fetchall(); stat='bills'
     elif metric=='same_day':
-        rows=c.execute('SELECT setter_id user_id,SUM(same_day) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
-        stat='same_day'
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(same_day),0) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,date_text)
+        ).fetchall(); stat='same_day'
     else:
-        rows=c.execute('SELECT setter_id user_id,SUM(within_48) value FROM appointment_events WHERE guild_id=? AND local_date=? GROUP BY setter_id',(g,today)).fetchall()
-        stat='within_48'
-    for r in rows: totals[r['user_id']]=float(r['value'] or 0)
-    adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',(g,stat,today)).fetchall()
+        rows=c.execute(
+            'SELECT setter_id user_id,COALESCE(SUM(within_48),0) value FROM appointment_events '
+            'WHERE guild_id=? AND local_date=? GROUP BY setter_id',
+            (g,date_text)
+        ).fetchall(); stat='within_48'
+
+    for r in rows:
+        totals[r['user_id']]=float(r['value'] or 0)
+
+    adj=c.execute(
+        'SELECT user_id,COALESCE(SUM(amount),0) value FROM stat_adjustments '
+        'WHERE guild_id=? AND stat_name=? AND local_date=? GROUP BY user_id',
+        (g,stat,date_text)
+    ).fetchall()
     c.close()
-    for r in adj: totals[r['user_id']]=totals.get(r['user_id'],0)+float(r['value'] or 0)
+
+    for r in adj:
+        totals[r['user_id']]=totals.get(r['user_id'],0)+float(r['value'] or 0)
+
     return {u:max(0,v) for u,v in totals.items()}
 
-def daily_leaders(g,metric):
-    totals=daily_metric_totals(g,metric)
+def daily_metric_totals(g,metric):
+    return daily_metric_totals_for_date(g,metric,dkey())
+
+def daily_leaders_for_date(g,metric,date_text):
+    totals=daily_metric_totals_for_date(g,metric,date_text)
     totals={u:v for u,v in totals.items() if v>0}
-    if not totals: return []
+    if not totals:
+        return []
     best=max(totals.values())
     return [u for u,v in totals.items() if v==best]
 
+def daily_leaders(g,metric):
+    return daily_leaders_for_date(g,metric,dkey())
+
+def point_man_result(g,date_text=None):
+    date_text=date_text or dkey()
+    appts=daily_metric_totals_for_date(g,'appointments',date_text)
+    eligible={u:int(v) for u,v in appts.items() if v>=2}
+    if not eligible:
+        return None,0,{'same_day':0,'within_48':0,'bills':0}
+
+    best=max(eligible.values())
+    tied=[u for u,v in eligible.items() if v==best]
+
+    quality={}
+    same=daily_metric_totals_for_date(g,'same_day',date_text)
+    within=daily_metric_totals_for_date(g,'within_48',date_text)
+    bills=daily_metric_totals_for_date(g,'bills',date_text)
+
+    # Quality tiebreakers: Same Day -> Within 48 -> Bill.
+    best_same=max(int(same.get(u,0)) for u in tied)
+    tied=[u for u in tied if int(same.get(u,0))==best_same]
+
+    if len(tied)>1:
+        best_within=max(int(within.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(within.get(u,0))==best_within]
+
+    if len(tied)>1:
+        best_bills=max(int(bills.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(bills.get(u,0))==best_bills]
+
+    # Final tiebreaker: whoever reached their final appointment count first.
+    if len(tied)>1:
+        c=con()
+        reached=[]
+        for uid in tied:
+            rows=c.execute(
+                'SELECT created_at,id FROM appointment_events '
+                'WHERE guild_id=? AND setter_id=? AND local_date=? ORDER BY id ASC',
+                (g,uid,date_text)
+            ).fetchall()
+            # Use the event that reached the winning count; if manual adjustments
+            # created the tie, fall back to the latest actual event.
+            idx=min(max(best-1,0),len(rows)-1) if rows else None
+            reached_at=rows[idx]['created_at'] if idx is not None else '9999'
+            reached_id=rows[idx]['id'] if idx is not None else 10**18
+            reached.append((reached_at,reached_id,uid))
+        c.close()
+        reached.sort(key=lambda x:(x[0],x[1],x[2]))
+        tied=[reached[0][2]]
+
+    uid=tied[0]
+    quality={
+        'same_day':int(same.get(uid,0)),
+        'within_48':int(within.get(uid,0)),
+        'bills':int(bills.get(uid,0))
+    }
+    return uid,best,quality
+
 async def refresh_daily_comp(guild):
-    for metric,badge in [('appointments','🎯 Point Man'),('bills','📄 Bounty Hunter'),('same_day','⚡ Same Day Savage'),('within_48','⏰ Speed Demon')]:
+    # Point Man always has ONE holder and requires at least 2 appointments.
+    point_uid,_,_=point_man_result(guild.id,dkey())
+    await set_holders(guild,'🎯 Point Man',[point_uid] if point_uid else [])
+
+    # Other daily quality badges can have tied holders.
+    for metric,badge in [
+        ('bills','📄 Bounty Hunter'),
+        ('same_day','⚡ Same Day Savage'),
+        ('within_48','⏰ Speed Demon')
+    ]:
         leaders=daily_leaders(guild.id,metric)
         await set_holders(guild,badge,leaders)
-        for uid in leaders:
-            if award_badge_count(guild.id,uid,badge,dkey()):
-                await announce_badge_milestone(guild,uid,badge)
+
+    # Daily competitive badge history is finalized at 9 PM instead of while
+    # the lead is still changing throughout the day.
 
 def closer_sales_today(g,u):
     today=dkey(); c=con()
@@ -1531,6 +1785,9 @@ async def on_ready():
         await restore_daily(g); await refresh_streaks(g)
     for g in bot.guilds:
         await refresh_leaderboard(g)
+        if now().weekday()!=6 and now().hour>=21:
+            await post_daily_awards(g)
+            await refresh_leaderboard(g)
         await weekly_kings(g)
         if now().weekday()==0:
             prev=now().date()-timedelta(days=1)
@@ -1548,6 +1805,12 @@ async def maintenance():
         if meta_get(g.id,'daily_date')!=dkey():
             await clear_roles(g,DAILY); meta_set(g.id,'daily_date',dkey()); await restore_daily(g)
         await refresh_streaks(g)
+
+        # Finalize and announce the day's badges at 9 PM Arizona time.
+        # Sunday is skipped as the bot's existing workday logic treats it as off.
+        if now().weekday()!=6 and now().hour>=21:
+            await post_daily_awards(g)
+
         # Keep cosmetic King roles synced all week.
         await weekly_kings(g)
         if now().weekday()==0:
@@ -1638,6 +1901,7 @@ async def appointment(
     await maybe_pressure_message(interaction.guild,'⚡ Same Day Savage','same_day')
     await maybe_pressure_message(interaction.guild,'⏰ Speed Demon','within_48')
     await maybe_night_owl_watch(interaction.guild,setter.id)
+    await set_live_night_owl(interaction.guild,dkey())
 
     await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
