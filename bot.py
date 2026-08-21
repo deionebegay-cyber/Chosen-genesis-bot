@@ -1374,6 +1374,9 @@ async def restore_daily(guild):
         if actual.get(uid,{}).get('h',0)>=19: ghosts.append(uid)
     await set_holders(guild,'👻 Ghost Hunter',ghosts)
     await refresh_daily_comp(guild)
+    # DAILY roles are cleared on restart/day rollover, so restore today's live
+    # Night Owl from the latest appointment already saved in the database.
+    await set_live_night_owl(guild,dkey())
 
 
 DAILY_APPOINTMENT_GOAL = 10
@@ -1474,6 +1477,17 @@ async def refresh_leaderboard(guild):
     def badge_scoreboard():
         rows=[]
         for badge in DAILY+STREAK+WEEKLY:
+            # Night Owl is live: always derive today's current holder directly
+            # from the saved appointment events. This makes the leaderboard
+            # accurate even after a restart or role-cache delay.
+            if badge=='🦉 Night Owl':
+                uid=last_setter_for_date(guild.id,dkey())
+                if uid:
+                    member=guild.get_member(uid)
+                    holder_name=member.display_name if member else f'<@{uid}>'
+                    rows.append(f"**{badge}** — {holder_name}")
+                continue
+
             role_obj=discord.utils.get(guild.roles,name=badge)
             holders=list(role_obj.members) if role_obj else []
             if not holders:
