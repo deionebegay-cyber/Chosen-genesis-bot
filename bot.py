@@ -1936,6 +1936,52 @@ async def maintenance():
 @maintenance.before_loop
 async def before_maintenance(): await bot.wait_until_ready()
 
+MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
+
+@bot.tree.command(name='givebadge',description='Manager-only: manually award a badge')
+@app_commands.describe(member='Who gets the badge',badge='Badge to award',announce='Announce it in main chat?')
+@app_commands.choices(badge=MANUAL_BADGE_CHOICES)
+async def givebadge(interaction:discord.Interaction,member:discord.Member,badge:app_commands.Choice[str],announce:bool=True):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+    badge_name=badge.value
+    manual_key=f'manual:{dkey()}:{interaction.id}'
+    award_badge_count(interaction.guild.id,member.id,badge_name,manual_key)
+    await add_role(interaction.guild,member,badge_name)
+    await announce_badge_milestone(interaction.guild,member.id,badge_name)
+    await refresh_leaderboard(interaction.guild)
+    await interaction.response.send_message(f'✅ Gave **{badge_name}** to {member.mention}. Badge history/count updated.',ephemeral=True)
+    if announce:
+        await main(interaction.guild,content=f'🏅 **MANAGER BADGE AWARD** — {member.mention} earned **{badge_name}**!')
+
+@bot.tree.command(name='removebadge',description='Manager-only: remove one badge award')
+@app_commands.describe(member='Who loses the badge',badge='Badge to remove',announce='Announce the correction?')
+@app_commands.choices(badge=MANUAL_BADGE_CHOICES)
+async def removebadge(interaction:discord.Interaction,member:discord.Member,badge:app_commands.Choice[str],announce:bool=False):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+    badge_name=badge.value
+    c=con(); row=c.execute('SELECT rowid FROM badge_awards WHERE guild_id=? AND user_id=? AND badge_name=? ORDER BY created_at DESC,rowid DESC LIMIT 1',(interaction.guild.id,member.id,badge_name)).fetchone()
+    if row:
+        c.execute('DELETE FROM badge_awards WHERE rowid=?',(row['rowid'],)); c.commit()
+    c.close()
+    if not row:
+        return await interaction.response.send_message(f'⚠️ No recorded **{badge_name}** award found for {member.mention}.',ephemeral=True)
+    if badge_count_for(interaction.guild.id,member.id,badge_name)==0:
+        r=discord.utils.get(interaction.guild.roles,name=badge_name)
+        if r and r in member.roles:
+            try: await member.remove_roles(r,reason='Manager removed badge award')
+            except discord.Forbidden: pass
+    await refresh_leaderboard(interaction.guild)
+    await interaction.response.send_message(f'✅ Removed one **{badge_name}** award from {member.mention}.',ephemeral=True)
+    if announce:
+        await main(interaction.guild,content=f'🛠️ **BADGE CORRECTION** — one **{badge_name}** award was removed from {member.mention}.')
+
+
 @bot.tree.command(name='dailyawards',description='Manager-only: post or re-post today’s Daily Awards')
 async def dailyawards(interaction:discord.Interaction):
     if not interaction.guild:
@@ -2042,6 +2088,21 @@ async def appointment(
     await refresh_leaderboard(interaction.guild)
 
 
+async def apply_daily_sale_badges(guild,member,count,ghost_hunter=False):
+    g=guild.id; today=dkey()
+    for threshold,badge,label in [(1,'💥 Sale','💥 **SALE BADGE!**'),(2,'🥈 2 Spot','🥈 **2 SPOT!**'),(3,'🎩 Hattrick','🎩 **HATTRICK!**')]:
+        if count>=threshold:
+            await add_role(guild,member,badge)
+        if count==threshold and award_badge_count(g,member.id,badge,today):
+            await announce_badge_milestone(guild,member.id,badge)
+            await main(guild,content=f'{label} {member.mention} has **{count} sale{"s" if count!=1 else ""} today!**')
+    if ghost_hunter:
+        await add_role(guild,member,'👻 Ghost Hunter')
+        if award_badge_count(g,member.id,'👻 Ghost Hunter',today):
+            await announce_badge_milestone(guild,member.id,'👻 Ghost Hunter')
+            await main(guild,content=f'👻 **GHOST HUNTER!** {member.mention} was part of a deal closed after 7 PM!')
+
+
 @bot.tree.command(name='sale',description='Log a new sale')
 @app_commands.describe(
     setter='Setter on the deal',
@@ -2107,36 +2168,13 @@ async def sale(
             closer_sales_today(g,closer.id),'closer sales','🤝'
         )
 
-    # Outside-team closers never receive closer stats, streaks, or daily closer badges.
+    # Sale badges belong to BOTH people on the deal.
+    setter_count=setter_sales_today(g,setter.id)
+    await apply_daily_sale_badges(interaction.guild,setter,setter_count,ghost_hunter=(n.hour>=19))
+
     if not outside_team:
-        count=closer_sales_today(g,closer.id)
-
-        if count>=1:
-            await add_role(interaction.guild,closer,'💥 Sale')
-        if count==1:
-            if award_badge_count(g,closer.id,'💥 Sale',dkey()):
-                await announce_badge_milestone(interaction.guild,closer.id,'💥 Sale')
-            await main(interaction.guild,content=f'💥 **SALE BADGE!** {closer.mention} got a sale today!')
-
-        if count>=2:
-            await add_role(interaction.guild,closer,'🥈 2 Spot')
-        if count==2:
-            if award_badge_count(g,closer.id,'🥈 2 Spot',dkey()):
-                await announce_badge_milestone(interaction.guild,closer.id,'🥈 2 Spot')
-            await main(interaction.guild,content=f'🥈 **2 SPOT!** {closer.mention} has **2 sales today!**')
-
-        if count>=3:
-            await add_role(interaction.guild,closer,'🎩 Hattrick')
-        if count==3:
-            if award_badge_count(g,closer.id,'🎩 Hattrick',dkey()):
-                await announce_badge_milestone(interaction.guild,closer.id,'🎩 Hattrick')
-            await main(interaction.guild,content=f'🎩 **HATTRICK!** {closer.mention} has **3 sales today!** 🔥')
-
-        if n.hour>=19:
-            await add_role(interaction.guild,closer,'👻 Ghost Hunter')
-            if award_badge_count(g,closer.id,'👻 Ghost Hunter',dkey()):
-                await announce_badge_milestone(interaction.guild,closer.id,'👻 Ghost Hunter')
-                await main(interaction.guild,content=f'👻 **GHOST HUNTER!** {closer.mention} closed a deal after 7 PM!')
+        closer_count=closer_sales_today(g,closer.id)
+        await apply_daily_sale_badges(interaction.guild,closer,closer_count,ghost_hunter=(n.hour>=19))
 
     await refresh_streaks(interaction.guild)
     await refresh_leaderboard(interaction.guild)
