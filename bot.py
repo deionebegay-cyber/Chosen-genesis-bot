@@ -1,5 +1,5 @@
 import os, sqlite3, random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
@@ -8,7 +8,7 @@ from discord.ext import commands, tasks
 TOKEN=os.getenv('DISCORD_TOKEN')
 DATA_PATH=os.getenv('DATA_PATH','genesis.db')
 GUILD_ID=os.getenv('GUILD_ID')
-TZ=ZoneInfo(os.getenv('TIMEZONE','America/Phoenix'))
+TZ=ZoneInfo('America/Phoenix')
 
 DAILY=['🩸 First Blood','🦉 Night Owl','👻 Ghost Hunter','🎯 Point Man','📄 Bounty Hunter','⚡ Same Day Savage','⏰ Speed Demon','💥 Sale','🥈 2 Spot','🎩 Hattrick']
 STREAK=['🔥 Hot Streak','🧊 Ice Cold']
@@ -272,6 +272,7 @@ def setup_db():
     c.commit(); c.close()
 
 def now(): return datetime.now(TZ)
+def awards_now(): return datetime.now(ZoneInfo('America/Phoenix'))
 def dkey(d=None): return (d or now().date()).isoformat()
 def wkey(d=None):
     iso=(d or now().date()).isocalendar(); return f'{iso.year}-W{iso.week:02d}'
@@ -705,22 +706,24 @@ async def finalize_daily_competitive_badges(guild,date_text):
 
     return point_uid,point_count,final
 
-async def post_daily_awards(guild):
-    date_text=dkey()
+async def post_daily_awards(guild,date_obj=None,force=False):
+    date_obj=date_obj or awards_now().date()
+    date_text=date_obj.isoformat()
     key=f'daily_awards_{date_text}'
-    if meta_get(guild.id,key):
-        return
+    if meta_get(guild.id,key) and not force:
+        return False
 
     appointments=daily_team_appointments_for_date(guild.id,date_text)
     sales=daily_team_sales(guild.id,date_text)
 
     # Don't post an empty recap on a day nobody worked.
     if appointments<=0 and sales<=0:
-        meta_set(guild.id,key,'empty')
-        return
+        if not force:
+            meta_set(guild.id,key,'empty')
+        return False
 
     point_uid,point_count,quality_badges=await finalize_daily_competitive_badges(guild,date_text)
-    night_uid=await finalize_night_owl(guild,now().date(),set_role=True)
+    night_uid=await finalize_night_owl(guild,date_obj,set_role=True)
     meta_set(guild.id,'night_owl_finalized',date_text)
 
     first_uid=first_setter_for_date(guild.id,date_text)
@@ -774,6 +777,7 @@ async def post_daily_awards(guild):
     await main(guild,embed=e)
     meta_set(guild.id,key,'posted')
     await refresh_leaderboard(guild)
+    return True
 
 def adjustment_sum(g,u,stat,start_date,end_date):
     c=con(); r=c.execute(
@@ -1001,7 +1005,7 @@ async def refresh_daily_comp(guild):
         leaders=daily_leaders(guild.id,metric)
         await set_holders(guild,badge,leaders)
 
-    # Daily competitive badge history is finalized at 9 PM instead of while
+    # Daily competitive badge history is finalized at 10 PM instead of while
     # the lead is still changing throughout the day.
 
 def closer_sales_today(g,u):
@@ -1885,8 +1889,13 @@ async def on_ready():
         await restore_daily(g); await refresh_streaks(g)
     for g in bot.guilds:
         await refresh_leaderboard(g)
-        if now().weekday()!=6 and now().hour>=21:
-            await post_daily_awards(g)
+        if awards_now().weekday()!=6 and awards_now().hour>=22:
+            try:
+                posted=await post_daily_awards(g,awards_now().date())
+                if posted:
+                    print(f'[DAILY AWARDS] Posted for guild {g.id} at {awards_now().isoformat()}')
+            except Exception as exc:
+                print(f'[DAILY AWARDS ERROR] guild={g.id} error={type(exc).__name__}: {exc}')
             await refresh_leaderboard(g)
         await weekly_kings(g)
         if now().weekday()==0:
@@ -1906,10 +1915,10 @@ async def maintenance():
             await clear_roles(g,DAILY); meta_set(g.id,'daily_date',dkey()); await restore_daily(g)
         await refresh_streaks(g)
 
-        # Finalize and announce the day's badges at 9 PM Arizona time.
+        # Finalize and announce the day's badges at 10 PM Arizona time.
         # Sunday is skipped as the bot's existing workday logic treats it as off.
-        if now().weekday()!=6 and now().hour>=21:
-            await post_daily_awards(g)
+        if awards_now().weekday()!=6 and awards_now().hour>=22:
+            await post_daily_awards(g,awards_now().date())
 
         # Keep cosmetic King roles synced all week.
         await weekly_kings(g)
@@ -1926,6 +1935,32 @@ async def maintenance():
 
 @maintenance.before_loop
 async def before_maintenance(): await bot.wait_until_ready()
+
+@bot.tree.command(name='dailyawards',description='Manager-only: post or re-post today’s Daily Awards')
+async def dailyawards(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    az=awards_now()
+    posted=await post_daily_awards(interaction.guild,az.date(),force=True)
+
+    if posted:
+        await interaction.followup.send(
+            f'✅ Daily Awards posted for **{az.strftime("%B %d")}**.',
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            '⚠️ I found **0 appointments and 0 sales** for today, so there was nothing to post.',
+            ephemeral=True
+        )
+
 
 @bot.tree.command(name='appointment',description='Log a new appointment')
 @app_commands.describe(
