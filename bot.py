@@ -281,6 +281,18 @@ def setup_db():
       guild_id INTEGER,user_id INTEGER,local_date TEXT,local_time TEXT,
       photo_url TEXT,photo_filename TEXT,created_at TEXT,
       UNIQUE(guild_id,user_id,local_date));
+    CREATE TABLE IF NOT EXISTS member_state(
+      guild_id INTEGER,user_id INTEGER,joined_date TEXT,
+      onboarding INTEGER DEFAULT 1,graduated_date TEXT,
+      PRIMARY KEY(guild_id,user_id));
+    CREATE TABLE IF NOT EXISTS attendance_records(
+      guild_id INTEGER,user_id INTEGER,local_date TEXT,status TEXT,
+      checkin_time TEXT,earned_freedom INTEGER DEFAULT 0,created_at TEXT,
+      PRIMARY KEY(guild_id,user_id,local_date));
+    CREATE TABLE IF NOT EXISTS weekly_credit_overrides(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,role_type TEXT,amount INTEGER,
+      source_date TEXT,credit_week_key TEXT,created_at TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -336,6 +348,91 @@ def today_checkins(guild_id):
     ).fetchall()
     c.close()
     return rows
+
+
+def ensure_member_state(guild_id,user_id,joined_date=None):
+    joined_date=joined_date or dkey()
+    c=con()
+    c.execute(
+        'INSERT OR IGNORE INTO member_state(guild_id,user_id,joined_date,onboarding) VALUES(?,?,?,1)',
+        (guild_id,user_id,joined_date)
+    )
+    c.commit(); c.close()
+
+def get_member_state(guild_id,user_id):
+    ensure_member_state(guild_id,user_id)
+    c=con()
+    row=c.execute(
+        'SELECT * FROM member_state WHERE guild_id=? AND user_id=?',
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return row
+
+def is_onboarding(guild_id,user_id):
+    row=get_member_state(guild_id,user_id)
+    return bool(row and int(row['onboarding'] or 0)==1)
+
+def is_workday(date_obj=None):
+    date_obj=date_obj or now().date()
+    return date_obj.weekday()!=6  # Sunday off
+
+def upsert_attendance(guild,member,date_text,status,checkin_time=None):
+    try:
+        d=datetime.strptime(date_text,'%Y-%m-%d').date()
+    except ValueError:
+        return
+    if not is_workday(d) or is_onboarding(guild.id,member.id):
+        return
+    earned=1 if has_earned_freedom(guild.id,member.id) else 0
+    c=con()
+    c.execute(
+        'INSERT INTO attendance_records(guild_id,user_id,local_date,status,checkin_time,earned_freedom,created_at) '
+        'VALUES(?,?,?,?,?,?,?) '
+        'ON CONFLICT(guild_id,user_id,local_date) DO UPDATE SET '
+        'status=excluded.status,checkin_time=excluded.checkin_time,earned_freedom=excluded.earned_freedom',
+        (guild.id,member.id,date_text,status,checkin_time,earned,datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
+def attendance_status_for_checkin(guild,member,dt):
+    if not is_workday(dt.date()):
+        return 'off_day'
+    if is_onboarding(guild.id,member.id):
+        return 'onboarding'
+    status,_,_=checkin_status_for_member(guild,member,dt)
+    return 'late' if status=='late' else 'on_time'
+
+def finalize_missed_checkins_for_date(guild,date_obj):
+    if not is_workday(date_obj):
+        return
+    date_text=date_obj.isoformat()
+    for member in guild.members:
+        if member.bot or not any(r.name.lower()=='setter' for r in member.roles):
+            continue
+        if is_onboarding(guild.id,member.id):
+            continue
+        c=con()
+        row=c.execute(
+            'SELECT 1 FROM checkins WHERE guild_id=? AND user_id=? AND local_date=? LIMIT 1',
+            (guild.id,member.id,date_text)
+        ).fetchone()
+        c.close()
+        if not row:
+            upsert_attendance(guild,member,date_text,'missed',None)
+
+def current_week_key():
+    return wkey(now().date())
+
+def weekly_override_total(g,user_id,role_type,wk):
+    c=con()
+    row=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM weekly_credit_overrides '
+        'WHERE guild_id=? AND user_id=? AND role_type=? AND credit_week_key=?',
+        (g,user_id,role_type,wk)
+    ).fetchone()
+    c.close()
+    return int(row['v'] or 0)
 
 def previous_month_bounds(d=None):
     d=d or now().date()
@@ -781,18 +878,19 @@ async def finalize_daily_competitive_badges(guild,date_text):
         await announce_badge_milestone(guild,bounty_uid,'📄 Bounty Hunter')
     final['📄 Bounty Hunter']=(bounty_leaders,bounty_count)
 
-    for metric,badge in [
-        ('same_day','⚡ Same Day Savage'),
-        ('within_48','⏰ Speed Demon')
-    ]:
-        leaders=daily_leaders_for_date(guild.id,metric,date_text)
-        await set_holders(guild,badge,leaders)
-        for uid in leaders:
-            if award_badge_count(guild.id,uid,badge,date_text):
-                await announce_badge_milestone(guild,uid,badge)
-        totals=daily_metric_totals_for_date(guild.id,metric,date_text)
-        best=max((int(totals.get(uid,0)) for uid in leaders),default=0)
-        final[badge]=(leaders,best)
+    same_uid,same_count=same_day_savage_result(guild.id,date_text)
+    same_leaders=[same_uid] if same_uid else []
+    await set_holders(guild,'⚡ Same Day Savage',same_leaders)
+    if same_uid and award_badge_count(guild.id,same_uid,'⚡ Same Day Savage',date_text):
+        await announce_badge_milestone(guild,same_uid,'⚡ Same Day Savage')
+    final['⚡ Same Day Savage']=(same_leaders,same_count)
+
+    speed_uid,speed_count=speed_demon_result(guild.id,date_text)
+    speed_leaders=[speed_uid] if speed_uid else []
+    await set_holders(guild,'⏰ Speed Demon',speed_leaders)
+    if speed_uid and award_badge_count(guild.id,speed_uid,'⏰ Speed Demon',date_text):
+        await announce_badge_milestone(guild,speed_uid,'⏰ Speed Demon')
+    final['⏰ Speed Demon']=(speed_leaders,speed_count)
 
     return point_uid,point_count,final
 
@@ -955,6 +1053,51 @@ def daily_leaders_for_date(g,metric,date_text):
 def daily_leaders(g,metric):
     return daily_leaders_for_date(g,metric,dkey())
 
+def quality_badge_single_winner(g,date_text,primary_metric,tiebreak_metrics):
+    primary=daily_metric_totals_for_date(g,primary_metric,date_text)
+    eligible={u:int(v) for u,v in primary.items() if v>0}
+    if not eligible:
+        return None,0
+
+    best=max(eligible.values())
+    tied=[u for u,v in eligible.items() if v==best]
+
+    for metric in tiebreak_metrics:
+        if len(tied)<=1:
+            break
+        totals=daily_metric_totals_for_date(g,metric,date_text)
+        high=max(int(totals.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(totals.get(u,0))==high]
+
+    if len(tied)>1:
+        c=con(); reached=[]
+        column={'same_day':'same_day','within_48':'within_48'}[primary_metric]
+        for uid in tied:
+            rows=c.execute(
+                f'SELECT id,created_at,{column} value FROM appointment_events '
+                'WHERE guild_id=? AND setter_id=? AND local_date=? ORDER BY id ASC',
+                (g,uid,date_text)
+            ).fetchall()
+            running=0; reached_at='9999'; reached_id=10**18
+            for r in rows:
+                running+=int(r['value'] or 0)
+                if running>=best:
+                    reached_at=r['created_at']; reached_id=r['id']; break
+            reached.append((reached_at,reached_id,uid))
+        c.close()
+        reached.sort(key=lambda x:(x[0],x[1],x[2]))
+        tied=[reached[0][2]]
+
+    return tied[0],best
+
+def same_day_savage_result(g,date_text=None):
+    date_text=date_text or dkey()
+    return quality_badge_single_winner(g,date_text,'same_day',['appointments','bills','within_48'])
+
+def speed_demon_result(g,date_text=None):
+    date_text=date_text or dkey()
+    return quality_badge_single_winner(g,date_text,'within_48',['appointments','same_day','bills'])
+
 def bounty_hunter_result(g,date_text=None):
     date_text=date_text or dkey()
 
@@ -1087,13 +1230,10 @@ async def refresh_daily_comp(guild):
     bounty_uid,_,_=bounty_hunter_result(guild.id,dkey())
     await set_holders(guild,'📄 Bounty Hunter',[bounty_uid] if bounty_uid else [])
 
-    # Other daily quality badges can have tied holders.
-    for metric,badge in [
-        ('same_day','⚡ Same Day Savage'),
-        ('within_48','⏰ Speed Demon')
-    ]:
-        leaders=daily_leaders(guild.id,metric)
-        await set_holders(guild,badge,leaders)
+    same_uid,_=same_day_savage_result(guild.id,dkey())
+    speed_uid,_=speed_demon_result(guild.id,dkey())
+    await set_holders(guild,'⚡ Same Day Savage',[same_uid] if same_uid else [])
+    await set_holders(guild,'⏰ Speed Demon',[speed_uid] if speed_uid else [])
 
     # Daily competitive badge history is finalized at 10 PM instead of while
     # the lead is still changing throughout the day.
@@ -1166,7 +1306,7 @@ def setter_king_winners(g,wk):
 
     rows=[]
     for uid in user_ids:
-        sales=period_total_for_user(g,uid,'sales',start_date,end_date)
+        sales=period_total_for_user(g,uid,'sales',start_date,end_date)+weekly_override_total(g,uid,'setter_sales',wk)
         appts=period_total_for_user(g,uid,'appointments',start_date,end_date)
         if sales>0:
             rows.append((uid,sales,appts,weekly_badge_points(g,uid,wk)))
@@ -1361,37 +1501,26 @@ async def send_weekly_manager_summary(guild,week_key):
     e.add_field(name='⚠️ LOW SETTER ACTIVITY',value=needs_text,inline=False)
 
     c=con()
-    check_rows=c.execute(
-        'SELECT user_id,local_date,local_time FROM checkins '
-        'WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+    attendance_rows=c.execute(
+        'SELECT user_id,status,COUNT(*) c FROM attendance_records '
+        'WHERE guild_id=? AND local_date BETWEEN ? AND ? GROUP BY user_id,status',
         (guild.id,start,end)
     ).fetchall()
     c.close()
 
-    late_counts={}
-    freedom_counts={}
-    for r in check_rows:
-        member=guild.get_member(r['user_id'])
-        if not member or not any(role.name.lower()=='setter' for role in member.roles):
-            continue
-        try:
-            dt=datetime.strptime(f"{r['local_date']} {r['local_time']}",'%Y-%m-%d %I:%M %p')
-        except ValueError:
-            continue
-        status,_,_=checkin_status_for_member(guild,member,dt)
-        if status=='late':
-            late_counts[member.id]=late_counts.get(member.id,0)+1
-        elif status in {'freedom','freedom_grace'}:
-            freedom_counts[member.id]=freedom_counts.get(member.id,0)+1
+    summary={}
+    for r in attendance_rows:
+        summary.setdefault(r['user_id'],{})[r['status']]=int(r['c'] or 0)
 
     attendance_lines=[]
-    for uid,count in sorted(late_counts.items(),key=lambda x:(-x[1],x[0])):
+    for uid,stats in summary.items():
         m=guild.get_member(uid)
-        if m:
-            attendance_lines.append(f'⚠️ **{m.display_name}** — {count} late check-in{"s" if count!=1 else ""}')
-    if freedom_counts:
-        total_freedom=sum(freedom_counts.values())
-        attendance_lines.append(f'🔓 Earned Freedom check-ins: **{total_freedom}**')
+        if not m:
+            continue
+        attendance_lines.append(
+            f'**{m.display_name}** — ✅ {stats.get("on_time",0)} on time • '
+            f'⚠️ {stats.get("late",0)} late • ❌ {stats.get("missed",0)} missed'
+        )
 
     e.add_field(
         name='🕐 CHECK-IN ACCOUNTABILITY',
@@ -1499,6 +1628,17 @@ def week_winners(g,wk,kind):
     for r in rows: totals[r['user_id']]=float(r['value'] or 0)
     adj=c.execute('SELECT user_id,SUM(amount) value FROM stat_adjustments WHERE guild_id=? AND week_key=? AND stat_name=? GROUP BY user_id',(g,wk,stat)).fetchall(); c.close()
     for r in adj: totals[r['user_id']]=max(0,totals.get(r['user_id'],0)+float(r['value'] or 0))
+
+    if kind!='setter':
+        c2=con()
+        override_users=[r['user_id'] for r in c2.execute(
+            'SELECT DISTINCT user_id FROM weekly_credit_overrides WHERE guild_id=? AND role_type=? AND credit_week_key=?',
+            (g,'closer_sales',wk)
+        ).fetchall()]
+        c2.close()
+        for uid in override_users:
+            totals[uid]=totals.get(uid,0)+weekly_override_total(g,uid,'closer_sales',wk)
+
     totals={u:v for u,v in totals.items() if v>0}
     if not totals: return [],0
     best=max(totals.values()); return [u for u,v in totals.items() if v==best],best
@@ -2001,6 +2141,7 @@ bot=Genesis(command_prefix='!',intents=intents)
 async def on_member_join(member):
     if member.bot:
         return
+    ensure_member_state(member.guild.id,member.id,now().date().isoformat())
     title,description=random.choice(WELCOME_MESSAGES)
     e=discord.Embed(
         title=title,
@@ -2014,11 +2155,16 @@ async def on_member_join(member):
 async def on_ready():
     print(f'Logged in as {bot.user}')
     for g in bot.guilds:
+        for m in g.members:
+            if not m.bot:
+                joined=(m.joined_at.astimezone(TZ).date().isoformat() if getattr(m,'joined_at',None) else dkey())
+                ensure_member_state(g.id,m.id,joined)
         if meta_get(g.id,'daily_date')!=dkey(): meta_set(g.id,'daily_date',dkey())
-        await restore_daily(g); await refresh_streaks(g)
+        await restore_daily(g); await refresh_daily_comp(g); await set_live_night_owl(g,dkey()); await refresh_streaks(g)
     for g in bot.guilds:
         await refresh_leaderboard(g)
         if awards_now().weekday()!=6 and awards_now().hour>=22:
+            finalize_missed_checkins_for_date(g,awards_now().date())
             try:
                 posted=await post_daily_awards(g,awards_now().date())
                 if posted:
@@ -2233,6 +2379,48 @@ async def dailyawards(interaction:discord.Interaction):
         )
 
 
+@bot.tree.command(name='graduation',description='Manager-only: graduate a rep from onboarding')
+@app_commands.describe(member='Rep who is ready to start being tracked')
+async def graduation(interaction:discord.Interaction,member:discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    ensure_member_state(interaction.guild.id,member.id)
+
+    c=con()
+    row=c.execute(
+        'SELECT onboarding FROM member_state WHERE guild_id=? AND user_id=?',
+        (interaction.guild.id,member.id)
+    ).fetchone()
+    if row and int(row['onboarding'] or 0)==0:
+        c.close()
+        return await interaction.followup.send(
+            f'✅ {member.mention} is already graduated and being tracked.',
+            ephemeral=True
+        )
+
+    c.execute(
+        'UPDATE member_state SET onboarding=0,graduated_date=? WHERE guild_id=? AND user_id=?',
+        (dkey(),interaction.guild.id,member.id)
+    )
+    c.commit(); c.close()
+
+    e=discord.Embed(
+        title='🎓 CHOSEN GENESIS — GRADUATION',
+        description=f'{member.mention} has officially completed onboarding.\n\n**Training wheels are off. You’re on the board now. 🔥**',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_footer(text='Chosen Genesis')
+    await main(interaction.guild,embed=e)
+    await interaction.followup.send(
+        f'✅ {member.mention} is now fully tracked for attendance/accountability.',
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name='checkin',description='Check in for the day with a required photo')
 @app_commands.describe(photo='Upload your check-in photo')
 async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
@@ -2285,9 +2473,19 @@ async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
         )
     c.close()
 
+    attendance_status=attendance_status_for_checkin(
+        interaction.guild,
+        interaction.user,
+        n.replace(tzinfo=None)
+    )
+    if attendance_status in {'on_time','late'}:
+        upsert_attendance(interaction.guild,interaction.user,local_date,attendance_status,local_time)
+
     status,_,_=checkin_status_for_member(interaction.guild,interaction.user,n.replace(tzinfo=None))
     freedom_line=''
-    if status in {'freedom','freedom_grace'}:
+    if is_onboarding(interaction.guild.id,interaction.user.id):
+        freedom_line='\n🆕 **Onboarding — not tracked for attendance yet**'
+    elif status in {'freedom','freedom_grace'}:
         deals=previous_month_setter_deals(interaction.guild.id,interaction.user.id)
         freedom_line=f'\n🔓 **Earned Freedom — {deals} deals last month**'
 
@@ -2314,93 +2512,61 @@ async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
 @bot.tree.command(name='checkins',description='Manager-only: see today’s setter check-ins')
 async def checkins(interaction:discord.Interaction):
     if not interaction.guild:
-        return await interaction.response.send_message(
-            'Use this command inside the server.',
-            ephemeral=True
-        )
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     if not is_manager(interaction.user):
-        return await interaction.response.send_message(
-            '❌ Only users with the **Manager** role can use this.',
-            ephemeral=True
-        )
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
 
+    if not is_workday(now().date()):
+        e=discord.Embed(
+            title='📋 CHOSEN GENESIS — TODAY’S SETTER CHECK-INS',
+            description='☀️ **Sunday is an off day. No attendance tracking today.**',
+            timestamp=datetime.now(timezone.utc)
+        )
+        return await interaction.followup.send(embed=e,ephemeral=True)
+
     rows=today_checkins(interaction.guild.id)
     by_user={r['user_id']:r for r in rows}
+    on_time=[]; late=[]; missed=[]; onboarding=[]
 
-    setters=[
-        m for m in interaction.guild.members
-        if not m.bot and any(r.name.lower()=='setter' for r in m.roles)
-    ]
-
-    on_time=[]
-    grace=[]
-    freedom=[]
-    late=[]
-    missing=[]
+    setters=[m for m in interaction.guild.members if not m.bot and any(r.name.lower()=='setter' for r in m.roles)]
 
     for member in setters:
-        row=by_user.get(member.id)
-        if not row:
-            missing.append(member.display_name)
+        if is_onboarding(interaction.guild.id,member.id):
+            state=get_member_state(interaction.guild.id,member.id)
+            onboarding.append(f'🆕 **{member.display_name}** — joined {state["joined_date"]}')
             continue
 
-        dt=parse_checkin_local_datetime(row)
-        status,_,_=checkin_status_for_member(interaction.guild,member,dt)
-        line=f'**{member.display_name}** — {row["local_time"]}'
-
-        if status=='on_time':
-            on_time.append(line)
-        elif status=='grace':
-            grace.append(line)
-        elif status in {'freedom','freedom_grace'}:
-            deals=previous_month_setter_deals(interaction.guild.id,member.id)
-            suffix=' (grace)' if status=='freedom_grace' else ''
-            freedom.append(f'{line} — {deals} deals last month{suffix}')
-        elif status=='late':
-            late.append(line)
+        row=by_user.get(member.id)
+        if row:
+            dt=parse_checkin_local_datetime(row)
+            status=attendance_status_for_checkin(interaction.guild,member,dt)
+            if status=='late':
+                late.append(f'⚠️ **{member.display_name}** — {row["local_time"]}')
+            else:
+                freedom=' 🔓' if has_earned_freedom(interaction.guild.id,member.id) else ''
+                on_time.append(f'✅ **{member.display_name}** — {row["local_time"]}{freedom}')
+        else:
+            current_minutes=minutes_since_midnight(now().hour,now().minute)
+            if has_earned_freedom(interaction.guild.id,member.id):
+                miss_after=minutes_since_midnight(FREEDOM_CUTOFF_HOUR,FREEDOM_CUTOFF_MINUTE)+FREEDOM_GRACE_MINUTES
+            else:
+                miss_after=minutes_since_midnight(REGULAR_CHECKIN_HOUR,REGULAR_CHECKIN_MINUTE)+REGULAR_GRACE_MINUTES
+            if current_minutes>miss_after:
+                missed.append(f'❌ **{member.display_name}**')
+                upsert_attendance(interaction.guild,member,dkey(),'missed',None)
 
     e=discord.Embed(
         title='📋 CHOSEN GENESIS — TODAY’S SETTER CHECK-INS',
-        description=(
-            f'**{now().strftime("%A, %B %d")}**\\n'
-            f'Regular target: **10:00 AM** • grace through **10:20 AM**\\n'
-            f'Earned Freedom: **4+ setter deals last month** • target **11:30 AM** • grace through **11:35 AM**'
-        ),
+        description=f'**{now().strftime("%A, %B %d")}**\nRegular final cutoff: **10:20 AM**\nEarned Freedom final cutoff: **11:35 AM**',
         timestamp=datetime.now(timezone.utc)
     )
-
-    e.add_field(
-        name='✅ ON TIME',
-        value='\\n'.join(f'✅ {x}' for x in on_time) or 'None',
-        inline=False
-    )
-    if grace:
-        e.add_field(
-            name='🟡 WITHIN GRACE',
-            value='\\n'.join(f'🟡 {x}' for x in grace),
-            inline=False
-        )
-    if freedom:
-        e.add_field(
-            name='🔓 EARNED FREEDOM',
-            value='\\n'.join(f'🔓 {x}' for x in freedom),
-            inline=False
-        )
-    if late:
-        e.add_field(
-            name='⚠️ LATE',
-            value='\\n'.join(f'⚠️ {x}' for x in late),
-            inline=False
-        )
-
-    e.add_field(
-        name='❌ NOT CHECKED IN',
-        value='\\n'.join(f'❌ **{name}**' for name in sorted(missing,key=str.lower)) or 'Everyone is checked in. 🔥',
-        inline=False
-    )
-
+    e.add_field(name='✅ ON TIME',value='\n'.join(on_time) or 'None',inline=False)
+    e.add_field(name='⚠️ LATE',value='\n'.join(late) or 'None',inline=False)
+    e.add_field(name='❌ MISSED',value='\n'.join(missed) or 'None',inline=False)
+    if onboarding:
+        e.add_field(name='🆕 ONBOARDING — NOT TRACKED',value='\n'.join(onboarding),inline=False)
     e.set_footer(text='Private manager view • Chosen Genesis')
     await interaction.followup.send(embed=e,ephemeral=True)
 
