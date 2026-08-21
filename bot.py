@@ -682,8 +682,15 @@ async def finalize_daily_competitive_badges(guild,date_text):
         await set_holders(guild,'🎯 Point Man',[])
 
     final={}
+
+    bounty_uid,bounty_count,_=bounty_hunter_result(guild.id,date_text)
+    bounty_leaders=[bounty_uid] if bounty_uid else []
+    await set_holders(guild,'📄 Bounty Hunter',bounty_leaders)
+    if bounty_uid and award_badge_count(guild.id,bounty_uid,'📄 Bounty Hunter',date_text):
+        await announce_badge_milestone(guild,bounty_uid,'📄 Bounty Hunter')
+    final['📄 Bounty Hunter']=(bounty_leaders,bounty_count)
+
     for metric,badge in [
-        ('bills','📄 Bounty Hunter'),
         ('same_day','⚡ Same Day Savage'),
         ('within_48','⏰ Speed Demon')
     ]:
@@ -854,6 +861,74 @@ def daily_leaders_for_date(g,metric,date_text):
 def daily_leaders(g,metric):
     return daily_leaders_for_date(g,metric,dkey())
 
+def bounty_hunter_result(g,date_text=None):
+    date_text=date_text or dkey()
+
+    bills=daily_metric_totals_for_date(g,'bills',date_text)
+    eligible={u:int(v) for u,v in bills.items() if v>0}
+    if not eligible:
+        return None,0,{'appointments':0,'same_day':0,'within_48':0}
+
+    best=max(eligible.values())
+    tied=[u for u,v in eligible.items() if v==best]
+
+    # Bounty Hunter tiebreakers:
+    # 1) Most bills
+    # 2) Most total appointments
+    # 3) Most same-day appointments
+    # 4) Most within-48-hour appointments
+    # 5) Whoever reached the winning bill count first
+    appts=daily_metric_totals_for_date(g,'appointments',date_text)
+    same=daily_metric_totals_for_date(g,'same_day',date_text)
+    within=daily_metric_totals_for_date(g,'within_48',date_text)
+
+    if len(tied)>1:
+        best_appts=max(int(appts.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(appts.get(u,0))==best_appts]
+
+    if len(tied)>1:
+        best_same=max(int(same.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(same.get(u,0))==best_same]
+
+    if len(tied)>1:
+        best_within=max(int(within.get(u,0)) for u in tied)
+        tied=[u for u in tied if int(within.get(u,0))==best_within]
+
+    if len(tied)>1:
+        c=con()
+        reached=[]
+        for uid in tied:
+            rows=c.execute(
+                'SELECT id,created_at,bill_collected FROM appointment_events '
+                'WHERE guild_id=? AND setter_id=? AND local_date=? '
+                'ORDER BY id ASC',
+                (g,uid,date_text)
+            ).fetchall()
+
+            running=0
+            reached_at='9999'
+            reached_id=10**18
+            for r in rows:
+                running += int(r['bill_collected'] or 0)
+                if running>=best:
+                    reached_at=r['created_at']
+                    reached_id=r['id']
+                    break
+            reached.append((reached_at,reached_id,uid))
+        c.close()
+
+        reached.sort(key=lambda x:(x[0],x[1],x[2]))
+        tied=[reached[0][2]]
+
+    uid=tied[0]
+    quality={
+        'appointments':int(appts.get(uid,0)),
+        'same_day':int(same.get(uid,0)),
+        'within_48':int(within.get(uid,0))
+    }
+    return uid,best,quality
+
+
 def point_man_result(g,date_text=None):
     date_text=date_text or dkey()
     appts=daily_metric_totals_for_date(g,'appointments',date_text)
@@ -914,9 +989,12 @@ async def refresh_daily_comp(guild):
     point_uid,_,_=point_man_result(guild.id,dkey())
     await set_holders(guild,'🎯 Point Man',[point_uid] if point_uid else [])
 
+    # Bounty Hunter always has ONE holder.
+    bounty_uid,_,_=bounty_hunter_result(guild.id,dkey())
+    await set_holders(guild,'📄 Bounty Hunter',[bounty_uid] if bounty_uid else [])
+
     # Other daily quality badges can have tied holders.
     for metric,badge in [
-        ('bills','📄 Bounty Hunter'),
         ('same_day','⚡ Same Day Savage'),
         ('within_48','⏰ Speed Demon')
     ]:
@@ -1375,7 +1453,7 @@ async def restore_daily(guild):
     await set_holders(guild,'👻 Ghost Hunter',ghosts)
     await refresh_daily_comp(guild)
     # DAILY roles are cleared on restart/day rollover, so restore today's live
-    # Night Owl from the latest appointment already saved in the database.
+    # competitive holders directly from today's saved appointment data.
     await set_live_night_owl(guild,dkey())
 
 
@@ -1482,6 +1560,14 @@ async def refresh_leaderboard(guild):
             # accurate even after a restart or role-cache delay.
             if badge=='🦉 Night Owl':
                 uid=last_setter_for_date(guild.id,dkey())
+                if uid:
+                    member=guild.get_member(uid)
+                    holder_name=member.display_name if member else f'<@{uid}>'
+                    rows.append(f"**{badge}** — {holder_name}")
+                continue
+
+            if badge=='📄 Bounty Hunter':
+                uid,_,_=bounty_hunter_result(guild.id,dkey())
                 if uid:
                     member=guild.get_member(uid)
                     holder_name=member.display_name if member else f'<@{uid}>'
