@@ -402,7 +402,9 @@ def upsert_attendance(guild,member,date_text,status,checkin_time=None):
         d=datetime.strptime(date_text,'%Y-%m-%d').date()
     except ValueError:
         return
-    if not is_workday(d) or is_onboarding(guild.id,member.id):
+
+    # Never create attendance accountability records for Greenies.
+    if not is_workday(d) or is_greenie(member) or not has_named_role(member,'Setter'):
         return
     earned=1 if has_earned_freedom(guild.id,member.id) else 0
     c=con()
@@ -418,8 +420,17 @@ def upsert_attendance(guild,member,date_text,status,checkin_time=None):
 def attendance_status_for_checkin(guild,member,dt):
     if not is_workday(dt.date()):
         return 'off_day'
-    if is_onboarding(guild.id,member.id):
-        return 'onboarding'
+
+    # Greenie role is the source of truth:
+    # Greenies may still check in and log production, but attendance does not
+    # count until they graduate and become a Setter.
+    if is_greenie(member):
+        return 'greenie'
+
+    # Attendance accountability applies to Setters only.
+    if not has_named_role(member,'Setter'):
+        return 'not_applicable'
+
     status,_,_=checkin_status_for_member(guild,member,dt)
     return 'late' if status=='late' else 'on_time'
 
@@ -428,9 +439,9 @@ def finalize_missed_checkins_for_date(guild,date_obj):
         return
     date_text=date_obj.isoformat()
     for member in guild.members:
-        if member.bot or not any(r.name.lower()=='setter' for r in member.roles):
+        if member.bot or not has_named_role(member,'Setter'):
             continue
-        if is_onboarding(guild.id,member.id):
+        if is_greenie(member):
             continue
         c=con()
         row=c.execute(
@@ -570,7 +581,7 @@ def greenie_status_embed(guild,member):
     )
     e.add_field(
         name='📸 CHECK-INS',
-        value=f'Completed: **{stats["checkins"]}**\n🛡️ Attendance Accountability: **Not Active Yet**',
+        value=f'Completed: **{stats["checkins"]}**\n🛡️ Attendance Accountability: **Starts when promoted to Setter**',
         inline=False
     )
     e.add_field(
@@ -630,6 +641,15 @@ def checkin_status_for_member(guild,member,checkin_dt):
         return 'not_applicable',None,None
 
     actual=minutes_since_midnight(checkin_dt.hour,checkin_dt.minute)
+
+    # Monday (0) and Thursday (3) are meeting days.
+    # Hard 4:00 PM cutoff: 4:00 is on time; 4:01+ is late.
+    # This overrides both the normal Setter cutoff and Earned Freedom cutoff.
+    if checkin_dt.weekday() in {0,3}:
+        cutoff=minutes_since_midnight(16,0)
+        if actual<=cutoff:
+            return 'on_time',cutoff,cutoff
+        return 'late',cutoff,cutoff
 
     if has_earned_freedom(guild.id,member.id):
         cutoff=minutes_since_midnight(FREEDOM_CUTOFF_HOUR,FREEDOM_CUTOFF_MINUTE)
@@ -2566,23 +2586,24 @@ async def on_ready():
                 joined=(m.joined_at.astimezone(TZ).date().isoformat() if getattr(m,'joined_at',None) else dkey())
                 ensure_member_state(g.id,m.id,joined)
 
-                state=get_member_state(g.id,m.id)
-                if state and int(state['onboarding'] or 0)==1:
-                    greenie_role=discord.utils.get(g.roles,name='Greenie')
-                    if greenie_role is None:
-                        try:
-                            greenie_role=await g.create_role(
-                                name='Greenie',
-                                reason='Chosen Genesis onboarding role restoration'
-                            )
-                        except (discord.Forbidden,discord.HTTPException):
-                            greenie_role=None
-                    if greenie_role is not None and greenie_role not in m.roles:
-                        try:
-                            await m.add_roles(greenie_role,reason='Restore Greenie onboarding role after restart')
-                        except (discord.Forbidden,discord.HTTPException):
-                            pass
+                # Reconcile database state FROM Discord roles.
+                # Greenie = onboarding/not attendance-tracked.
+                # Setter without Greenie = graduated/attendance-tracked.
+                if is_greenie(m):
                     ensure_greenie_progress(g.id,m.id)
+                    c=con()
+                    c.execute(
+                        'UPDATE member_state SET onboarding=1 WHERE guild_id=? AND user_id=?',
+                        (g.id,m.id)
+                    )
+                    c.commit(); c.close()
+                elif has_named_role(m,'Setter'):
+                    c=con()
+                    c.execute(
+                        'UPDATE member_state SET onboarding=0 WHERE guild_id=? AND user_id=?',
+                        (g.id,m.id)
+                    )
+                    c.commit(); c.close()
         if meta_get(g.id,'daily_date')!=dkey(): meta_set(g.id,'daily_date',dkey())
         await restore_daily(g); await refresh_daily_comp(g); await set_live_night_owl(g,dkey()); await refresh_streaks(g)
     for g in bot.guilds:
@@ -3497,6 +3518,13 @@ async def graduation(interaction:discord.Interaction,member:discord.Member):
         'UPDATE member_state SET onboarding=0,graduated_date=? WHERE guild_id=? AND user_id=?',
         (dkey(),interaction.guild.id,member.id)
     )
+
+    # Graduation is the exact handoff into Setter accountability. Do not carry
+    # any pre-graduation attendance status into their Setter record.
+    c.execute(
+        'DELETE FROM attendance_records WHERE guild_id=? AND user_id=? AND local_date=?',
+        (interaction.guild.id,member.id,dkey())
+    )
     c.commit(); c.close()
 
     e=discord.Embed(
@@ -3582,9 +3610,9 @@ async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
 
     status,_,_=checkin_status_for_member(interaction.guild,interaction.user,n.replace(tzinfo=None))
     freedom_line=''
-    if is_onboarding(interaction.guild.id,interaction.user.id):
-        freedom_line='\n🆕 **Onboarding — not tracked for attendance yet**'
-    elif status in {'freedom','freedom_grace'}:
+    # Keep public check-ins clean. Greenies can check in normally without a
+    # public "not tracked" label. Earned Freedom is shown only for Setters.
+    if has_named_role(interaction.user,'Setter') and not is_greenie(interaction.user) and status in {'freedom','freedom_grace'}:
         deals=previous_month_setter_deals(interaction.guild.id,interaction.user.id)
         freedom_line=f'\n🔓 **Earned Freedom — {deals} deals last month**'
 
@@ -3627,15 +3655,15 @@ async def checkins(interaction:discord.Interaction):
 
     rows=today_checkins(interaction.guild.id)
     by_user={r['user_id']:r for r in rows}
-    on_time=[]; late=[]; missed=[]; onboarding=[]
+    on_time=[]; late=[]; missed=[]
 
-    setters=[m for m in interaction.guild.members if not m.bot and any(r.name.lower()=='setter' for r in m.roles)]
+    # Only graduated Setters are part of attendance accountability.
+    setters=[
+        m for m in interaction.guild.members
+        if not m.bot and has_named_role(m,'Setter') and not is_greenie(m)
+    ]
 
     for member in setters:
-        if is_onboarding(interaction.guild.id,member.id):
-            state=get_member_state(interaction.guild.id,member.id)
-            onboarding.append(f'🆕 **{member.display_name}** — joined {state["joined_date"]}')
-            continue
 
         row=by_user.get(member.id)
         if row:
@@ -3648,24 +3676,34 @@ async def checkins(interaction:discord.Interaction):
                 on_time.append(f'✅ **{member.display_name}** — {row["local_time"]}{freedom}')
         else:
             current_minutes=minutes_since_midnight(now().hour,now().minute)
-            if has_earned_freedom(interaction.guild.id,member.id):
+
+            # Monday/Thursday meeting days use a hard 4:00 PM cutoff.
+            if now().weekday() in {0,3}:
+                miss_after=minutes_since_midnight(16,0)
+            elif has_earned_freedom(interaction.guild.id,member.id):
                 miss_after=minutes_since_midnight(FREEDOM_CUTOFF_HOUR,FREEDOM_CUTOFF_MINUTE)+FREEDOM_GRACE_MINUTES
             else:
                 miss_after=minutes_since_midnight(REGULAR_CHECKIN_HOUR,REGULAR_CHECKIN_MINUTE)+REGULAR_GRACE_MINUTES
+
             if current_minutes>miss_after:
                 missed.append(f'❌ **{member.display_name}**')
                 upsert_attendance(interaction.guild,member,dkey(),'missed',None)
 
     e=discord.Embed(
         title='📋 CHOSEN GENESIS — TODAY’S SETTER CHECK-INS',
-        description=f'**{now().strftime("%A, %B %d")}**\nRegular final cutoff: **10:20 AM**\nEarned Freedom final cutoff: **11:35 AM**',
+        description=(
+            f'**{now().strftime("%A, %B %d")}**\n'
+            + (
+                '📅 Meeting Day — hard check-in cutoff: **4:00 PM**'
+                if now().weekday() in {0,3}
+                else 'Regular final cutoff: **10:20 AM**\nEarned Freedom final cutoff: **11:35 AM**'
+            )
+        ),
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(name='✅ ON TIME',value='\n'.join(on_time) or 'None',inline=False)
     e.add_field(name='⚠️ LATE',value='\n'.join(late) or 'None',inline=False)
     e.add_field(name='❌ MISSED',value='\n'.join(missed) or 'None',inline=False)
-    if onboarding:
-        e.add_field(name='🆕 ONBOARDING — NOT TRACKED',value='\n'.join(onboarding),inline=False)
     e.set_footer(text='Private manager view • Chosen Genesis')
     await interaction.followup.send(embed=e,ephemeral=True)
 
