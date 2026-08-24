@@ -303,6 +303,16 @@ def setup_db():
     CREATE TABLE IF NOT EXISTS challenge_participants(
       challenge_id INTEGER,user_id INTEGER,score INTEGER DEFAULT 0,
       PRIMARY KEY(challenge_id,user_id));
+    CREATE TABLE IF NOT EXISTS greenie_progress(
+      guild_id INTEGER,user_id INTEGER,
+      pitch_url TEXT,pitch_filename TEXT,pitch_submitted_at TEXT,
+      pitch_approved INTEGER DEFAULT 0,pitch_approved_by INTEGER,pitch_approved_at TEXT,
+      graduation_requested INTEGER DEFAULT 0,graduation_requested_at TEXT,
+      PRIMARY KEY(guild_id,user_id));
+    CREATE TABLE IF NOT EXISTS bootcamp_submissions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,submitted_at TEXT,
+      status TEXT DEFAULT 'pending',reviewed_by INTEGER,reviewed_at TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -443,6 +453,159 @@ def weekly_override_total(g,user_id,role_type,wk):
     ).fetchone()
     c.close()
     return int(row['v'] or 0)
+
+
+def has_named_role(member,name):
+    return isinstance(member,discord.Member) and any(r.name.lower()==name.lower() for r in member.roles)
+
+def is_greenie(member):
+    return has_named_role(member,'Greenie')
+
+def ensure_greenie_progress(guild_id,user_id):
+    c=con()
+    c.execute(
+        'INSERT OR IGNORE INTO greenie_progress(guild_id,user_id) VALUES(?,?)',
+        (guild_id,user_id)
+    )
+    c.commit(); c.close()
+
+def greenie_progress(guild_id,user_id):
+    ensure_greenie_progress(guild_id,user_id)
+    c=con()
+    row=c.execute(
+        'SELECT * FROM greenie_progress WHERE guild_id=? AND user_id=?',
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return row
+
+def approved_bootcamp_count(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        "SELECT COUNT(*) c FROM bootcamp_submissions WHERE guild_id=? AND user_id=? AND status='approved'",
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return int(row['c'] or 0)
+
+def pending_bootcamp_count(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        "SELECT COUNT(*) c FROM bootcamp_submissions WHERE guild_id=? AND user_id=? AND status='pending'",
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return int(row['c'] or 0)
+
+def greenie_ready(guild_id,user_id):
+    p=greenie_progress(guild_id,user_id)
+    return approved_bootcamp_count(guild_id,user_id)>=3 and bool(int(p['pitch_approved'] or 0))
+
+def greenie_stats(guild_id,user_id):
+    c=con()
+    vals={}
+    for metric in ['appointments','sales','bills','same_day','within_48','checkins']:
+        if metric=='checkins':
+            row=c.execute(
+                'SELECT COUNT(*) v FROM checkins WHERE guild_id=? AND user_id=?',
+                (guild_id,user_id)
+            ).fetchone()
+        else:
+            row=c.execute(
+                'SELECT COALESCE(SUM(value),0) v FROM stats WHERE guild_id=? AND user_id=? AND metric=?',
+                (guild_id,user_id,metric)
+            ).fetchone()
+        vals[metric]=int(row['v'] or 0)
+    c.close()
+    return vals
+
+def greenie_status_embed(guild,member):
+    p=greenie_progress(guild.id,member.id)
+    approved=approved_bootcamp_count(guild.id,member.id)
+    pending=pending_bootcamp_count(guild.id,member.id)
+    stats=greenie_stats(guild.id,member.id)
+    pitch_submitted=bool(p['pitch_url'])
+    pitch_approved=bool(int(p['pitch_approved'] or 0))
+    requested=bool(int(p['graduation_requested'] or 0))
+    ready=approved>=3 and pitch_approved
+
+    next_steps=[]
+    if approved<3:
+        next_steps.append(f'Complete **{3-approved} more approved bootcamp{"s" if 3-approved!=1 else ""}**')
+    if not pitch_submitted:
+        next_steps.append('Submit your **pitch video**')
+    elif not pitch_approved:
+        next_steps.append('Get your **pitch approved by a Manager**')
+    if ready and not requested:
+        next_steps.append('Use **/graduation_request**')
+    elif ready and requested:
+        next_steps.append('Waiting for **Manager graduation approval**')
+
+    e=discord.Embed(
+        title=f'🎓 GREENIE STATUS — {member.display_name.upper()}',
+        description='New setter onboarding progress.',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(
+        name='🏕️ TRAINING',
+        value=(
+            f'Bootcamps: **{approved}/3 approved**'
+            + (f' • **{pending} pending**' if pending else '') + '\n'
+            f'Pitch Submitted: **{"✅" if pitch_submitted else "❌"}**\n'
+            f'Pitch Approved: **{"✅" if pitch_approved else "❌"}**\n'
+            f'Graduation Request: **{"✅ Submitted" if requested else "Not submitted"}**'
+        ),
+        inline=False
+    )
+    e.add_field(
+        name='📊 PRODUCTION WHILE TRAINING',
+        value=(
+            f'📅 Appointments: **{stats["appointments"]}**\n'
+            f'💰 Setter Sales: **{stats["sales"]}**\n'
+            f'📄 Bills: **{stats["bills"]}**\n'
+            f'⚡ Same-Days: **{stats["same_day"]}**\n'
+            f'⏰ Within 48 Hours: **{stats["within_48"]}**'
+        ),
+        inline=False
+    )
+    e.add_field(
+        name='📸 CHECK-INS',
+        value=f'Completed: **{stats["checkins"]}**\n🛡️ Attendance Accountability: **Not Active Yet**',
+        inline=False
+    )
+    e.add_field(
+        name='➡️ NEXT STEP',
+        value='\n'.join(f'• {x}' for x in next_steps) if next_steps else '✅ Ready for manager graduation.',
+        inline=False
+    )
+    e.set_footer(text='Chosen Genesis Bootcamp')
+    return e
+
+async def bootcamp_channel(guild):
+    return discord.utils.get(guild.text_channels,name='bootcamp')
+
+async def post_greenie_status(guild,member):
+    ch=await bootcamp_channel(guild)
+    if ch:
+        try:
+            await ch.send(embed=greenie_status_embed(guild,member))
+        except (discord.Forbidden,discord.HTTPException):
+            pass
+
+def greenie_pipeline_text(guild):
+    lines=[]
+    for member in guild.members:
+        if member.bot or not is_greenie(member):
+            continue
+        p=greenie_progress(guild.id,member.id)
+        bc=approved_bootcamp_count(guild.id,member.id)
+        stats=greenie_stats(guild.id,member.id)
+        pitch='✅' if int(p['pitch_approved'] or 0) else ('⏳' if p['pitch_url'] else '❌')
+        lines.append(
+            f'**{member.display_name}** — 🏕️ {bc}/3 • 🎥 {pitch} • '
+            f'📅 {stats["appointments"]} apps • 💰 {stats["sales"]} sales'
+        )
+    return '\n'.join(lines[:10])
 
 def previous_month_bounds(d=None):
     d=d or now().date()
@@ -1667,6 +1830,10 @@ def manager_review_embed(guild,start,end,title,description):
     if watch:
         e.add_field(name='📌 MANAGER WATCHLIST',value='\n'.join(watch[:8])[:1024],inline=False)
 
+    greenies=greenie_pipeline_text(guild)
+    if greenies:
+        e.add_field(name='🆕 GREENIE PIPELINE',value=greenies[:1024],inline=False)
+
     e.set_footer(text='Private manager intelligence • Chosen Genesis')
     return e
 
@@ -2345,15 +2512,50 @@ bot=Genesis(command_prefix='!',intents=intents)
 async def on_member_join(member):
     if member.bot:
         return
+
     ensure_member_state(member.guild.id,member.id,now().date().isoformat())
+
+    # Every new human member starts as a Greenie.
+    greenie_role=discord.utils.get(member.guild.roles,name='Greenie')
+    if greenie_role is None:
+        try:
+            greenie_role=await member.guild.create_role(
+                name='Greenie',
+                reason='Chosen Genesis automatic onboarding role'
+            )
+        except (discord.Forbidden,discord.HTTPException):
+            greenie_role=None
+
+    if greenie_role is not None and greenie_role not in member.roles:
+        try:
+            await member.add_roles(greenie_role,reason='New member entered Chosen Genesis onboarding')
+        except (discord.Forbidden,discord.HTTPException):
+            pass
+
+    ensure_greenie_progress(member.guild.id,member.id)
+
     title,description=random.choice(WELCOME_MESSAGES)
     e=discord.Embed(
         title=title,
         description=description.format(mention=member.mention),
         timestamp=datetime.now(timezone.utc)
     )
+    e.add_field(
+        name='🆕 GREENIE ONBOARDING',
+        value=(
+            'You have been added to the **Greenie** onboarding track.\n'
+            'Head to **#bootcamp** to complete your training.'
+        ),
+        inline=False
+    )
     e.set_footer(text='Chosen Genesis')
     await main(member.guild,embed=e)
+
+    # Post their starting onboarding status in the bootcamp channel.
+    try:
+        await post_greenie_status(member.guild,member)
+    except Exception as exc:
+        print(f'[GREENIE STATUS ERROR] member={member.id} error={type(exc).__name__}: {exc}')
 
 @bot.event
 async def on_ready():
@@ -2363,6 +2565,24 @@ async def on_ready():
             if not m.bot:
                 joined=(m.joined_at.astimezone(TZ).date().isoformat() if getattr(m,'joined_at',None) else dkey())
                 ensure_member_state(g.id,m.id,joined)
+
+                state=get_member_state(g.id,m.id)
+                if state and int(state['onboarding'] or 0)==1:
+                    greenie_role=discord.utils.get(g.roles,name='Greenie')
+                    if greenie_role is None:
+                        try:
+                            greenie_role=await g.create_role(
+                                name='Greenie',
+                                reason='Chosen Genesis onboarding role restoration'
+                            )
+                        except (discord.Forbidden,discord.HTTPException):
+                            greenie_role=None
+                    if greenie_role is not None and greenie_role not in m.roles:
+                        try:
+                            await m.add_roles(greenie_role,reason='Restore Greenie onboarding role after restart')
+                        except (discord.Forbidden,discord.HTTPException):
+                            pass
+                    ensure_greenie_progress(g.id,m.id)
         if meta_get(g.id,'daily_date')!=dkey(): meta_set(g.id,'daily_date',dkey())
         await restore_daily(g); await refresh_daily_comp(g); await set_live_night_owl(g,dkey()); await refresh_streaks(g)
     for g in bot.guilds:
@@ -3078,29 +3298,201 @@ async def dailyawards(interaction:discord.Interaction):
         )
 
 
-@bot.tree.command(name='graduation',description='Manager-only: graduate a rep from onboarding')
-@app_commands.describe(member='Rep who is ready to start being tracked')
+@bot.tree.command(name='bootcamp',description='Greenie: submit a bootcamp attendance for manager approval')
+async def bootcamp_submit(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_greenie(interaction.user):
+        return await interaction.response.send_message('❌ This command is for members with the **Greenie** role.',ephemeral=True)
+    if approved_bootcamp_count(interaction.guild.id,interaction.user.id)>=3:
+        return await interaction.response.send_message('✅ You already have all **3/3 approved bootcamps**.',ephemeral=True)
+
+    c=con()
+    c.execute(
+        "INSERT INTO bootcamp_submissions(guild_id,user_id,submitted_at,status) VALUES(?,?,?,'pending')",
+        (interaction.guild.id,interaction.user.id,datetime.now(timezone.utc).isoformat())
+    )
+    c.commit(); c.close()
+
+    await interaction.response.send_message(
+        '🏕️ Bootcamp submitted. A **Manager must approve it** before it counts toward your 3 required bootcamps.',
+        ephemeral=True
+    )
+    ch=await bootcamp_channel(interaction.guild)
+    if ch:
+        await ch.send(
+            f'🏕️ **BOOTCAMP APPROVAL NEEDED**\n{interaction.user.mention} submitted a bootcamp attendance.\n'
+            f'Current approved: **{approved_bootcamp_count(interaction.guild.id,interaction.user.id)}/3**'
+        )
+
+
+@bot.tree.command(name='approvebootcamp',description='Manager-only: approve one pending Greenie bootcamp')
+@app_commands.describe(member='Greenie whose pending bootcamp you are approving')
+async def approvebootcamp(interaction:discord.Interaction,member:discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only Managers can approve bootcamps.',ephemeral=True)
+    if not is_greenie(member):
+        return await interaction.response.send_message('❌ That member does not have the **Greenie** role.',ephemeral=True)
+
+    c=con()
+    row=c.execute(
+        "SELECT id FROM bootcamp_submissions WHERE guild_id=? AND user_id=? AND status='pending' ORDER BY id ASC LIMIT 1",
+        (interaction.guild.id,member.id)
+    ).fetchone()
+    if not row:
+        c.close()
+        return await interaction.response.send_message('❌ That Greenie has no pending bootcamp submission.',ephemeral=True)
+    if approved_bootcamp_count(interaction.guild.id,member.id)>=3:
+        c.close()
+        return await interaction.response.send_message('✅ They already have 3/3 approved bootcamps.',ephemeral=True)
+
+    c.execute(
+        "UPDATE bootcamp_submissions SET status='approved',reviewed_by=?,reviewed_at=? WHERE id=?",
+        (interaction.user.id,datetime.now(timezone.utc).isoformat(),row['id'])
+    )
+    c.commit(); c.close()
+
+    count=approved_bootcamp_count(interaction.guild.id,member.id)
+    await interaction.response.send_message(f'✅ Approved. {member.mention} is now at **{count}/3 bootcamps**.',ephemeral=True)
+    await post_greenie_status(interaction.guild,member)
+
+
+@bot.tree.command(name='pitchvideo',description='Greenie: submit your pitch video for manager approval')
+@app_commands.describe(video='Upload your pitch video')
+async def pitchvideo(interaction:discord.Interaction,video:discord.Attachment):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_greenie(interaction.user):
+        return await interaction.response.send_message('❌ This command is for members with the **Greenie** role.',ephemeral=True)
+
+    ensure_greenie_progress(interaction.guild.id,interaction.user.id)
+    c=con()
+    c.execute(
+        'UPDATE greenie_progress SET pitch_url=?,pitch_filename=?,pitch_submitted_at=?,pitch_approved=0,pitch_approved_by=NULL,pitch_approved_at=NULL '
+        'WHERE guild_id=? AND user_id=?',
+        (video.url,video.filename,datetime.now(timezone.utc).isoformat(),interaction.guild.id,interaction.user.id)
+    )
+    c.commit(); c.close()
+
+    await interaction.response.send_message('🎥 Pitch submitted for **Manager approval**.',ephemeral=True)
+    ch=await bootcamp_channel(interaction.guild)
+    if ch:
+        e=discord.Embed(
+            title='🎥 PITCH APPROVAL NEEDED',
+            description=f'{interaction.user.mention} submitted a pitch video.\n**File:** {video.filename}',
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(name='Video',value=video.url,inline=False)
+        await ch.send(embed=e)
+
+
+@bot.tree.command(name='approvepitch',description='Manager-only: approve a Greenie pitch video')
+@app_commands.describe(member='Greenie whose pitch you are approving')
+async def approvepitch(interaction:discord.Interaction,member:discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only Managers can approve pitch videos.',ephemeral=True)
+    p=greenie_progress(interaction.guild.id,member.id)
+    if not p['pitch_url']:
+        return await interaction.response.send_message('❌ That Greenie has not submitted a pitch video.',ephemeral=True)
+
+    c=con()
+    c.execute(
+        'UPDATE greenie_progress SET pitch_approved=1,pitch_approved_by=?,pitch_approved_at=? WHERE guild_id=? AND user_id=?',
+        (interaction.user.id,datetime.now(timezone.utc).isoformat(),interaction.guild.id,member.id)
+    )
+    c.commit(); c.close()
+    await interaction.response.send_message(f'✅ {member.mention}’s pitch is approved.',ephemeral=True)
+    await post_greenie_status(interaction.guild,member)
+
+
+@bot.tree.command(name='greenie',description='View a Greenie’s onboarding progress')
+@app_commands.describe(member='Greenie to view; leave blank to view yourself')
+async def greenie(interaction:discord.Interaction,member:discord.Member|None=None):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    target=member or interaction.user
+    if target.id!=interaction.user.id and not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only Managers can view another Greenie’s private status.',ephemeral=True)
+    if not is_greenie(target):
+        return await interaction.response.send_message('❌ That member is not currently a Greenie.',ephemeral=True)
+    await interaction.response.send_message(embed=greenie_status_embed(interaction.guild,target),ephemeral=True)
+
+
+@bot.tree.command(name='graduation_request',description='Greenie: request manager approval for graduation')
+async def graduation_request(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_greenie(interaction.user):
+        return await interaction.response.send_message('❌ This command is for Greenies.',ephemeral=True)
+    if not greenie_ready(interaction.guild.id,interaction.user.id):
+        p=greenie_progress(interaction.guild.id,interaction.user.id)
+        return await interaction.response.send_message(
+            f'❌ Not ready yet. You need **3/3 approved bootcamps** and an **approved pitch**.\n'
+            f'Bootcamps: **{approved_bootcamp_count(interaction.guild.id,interaction.user.id)}/3** • '
+            f'Pitch approved: **{"Yes" if int(p["pitch_approved"] or 0) else "No"}**',
+            ephemeral=True
+        )
+
+    c=con()
+    c.execute(
+        'UPDATE greenie_progress SET graduation_requested=1,graduation_requested_at=? WHERE guild_id=? AND user_id=?',
+        (datetime.now(timezone.utc).isoformat(),interaction.guild.id,interaction.user.id)
+    )
+    c.commit(); c.close()
+
+    await interaction.response.send_message('🎓 Graduation request submitted. **Manager approval is required.**',ephemeral=True)
+    ch=await bootcamp_channel(interaction.guild)
+    if ch:
+        await ch.send(
+            f'🎓 **READY FOR GRADUATION**\n{interaction.user.mention} has completed:\n'
+            f'✅ 3/3 approved bootcamps\n✅ Pitch submitted + approved\n\n'
+            f'**Manager:** use `/graduation` when approved.'
+        )
+
+
+@bot.tree.command(name='graduation',description='Manager-only: graduate an approved Greenie to Setter')
+@app_commands.describe(member='Greenie who completed onboarding')
 async def graduation(interaction:discord.Interaction,member:discord.Member):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     if not is_manager(interaction.user):
         return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+    if not is_greenie(member):
+        return await interaction.response.send_message('❌ That member does not currently have the **Greenie** role.',ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     ensure_member_state(interaction.guild.id,member.id)
+    p=greenie_progress(interaction.guild.id,member.id)
+    bootcamps=approved_bootcamp_count(interaction.guild.id,member.id)
 
-    c=con()
-    row=c.execute(
-        'SELECT onboarding FROM member_state WHERE guild_id=? AND user_id=?',
-        (interaction.guild.id,member.id)
-    ).fetchone()
-    if row and int(row['onboarding'] or 0)==0:
-        c.close()
+    if bootcamps<3 or not int(p['pitch_approved'] or 0):
         return await interaction.followup.send(
-            f'✅ {member.mention} is already graduated and being tracked.',
+            f'❌ {member.mention} has not completed the graduation requirements.\n'
+            f'🏕️ Bootcamps: **{bootcamps}/3**\n'
+            f'🎥 Pitch approved: **{"Yes" if int(p["pitch_approved"] or 0) else "No"}**',
             ephemeral=True
         )
 
+    greenie_role=discord.utils.get(interaction.guild.roles,name='Greenie')
+    setter_role=discord.utils.get(interaction.guild.roles,name='Setter')
+    if setter_role is None:
+        setter_role=await interaction.guild.create_role(name='Setter',reason='Chosen Genesis graduation')
+
+    try:
+        await member.add_roles(setter_role,reason='Chosen Genesis graduation')
+        if greenie_role and greenie_role in member.roles:
+            await member.remove_roles(greenie_role,reason='Chosen Genesis graduation')
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            '❌ I could not change the roles. Put the bot role **above Greenie and Setter** in Server Settings → Roles.',
+            ephemeral=True
+        )
+
+    c=con()
     c.execute(
         'UPDATE member_state SET onboarding=0,graduated_date=? WHERE guild_id=? AND user_id=?',
         (dkey(),interaction.guild.id,member.id)
@@ -3109,15 +3501,23 @@ async def graduation(interaction:discord.Interaction,member:discord.Member):
 
     e=discord.Embed(
         title='🎓 CHOSEN GENESIS — GRADUATION',
-        description=f'{member.mention} has officially completed onboarding.\n\n**Training wheels are off. You’re on the board now. 🔥**',
+        description=(
+            f'{member.mention} has officially completed onboarding.\n\n'
+            f'✅ 3/3 Bootcamps\n'
+            f'✅ Pitch Approved\n'
+            f'✅ Promoted **Greenie → Setter**\n\n'
+            f'**Training wheels are off. You’re on the board now. 🔥**'
+        ),
         timestamp=datetime.now(timezone.utc)
     )
     e.set_footer(text='Chosen Genesis')
     await main(interaction.guild,embed=e)
     await interaction.followup.send(
-        f'✅ {member.mention} is now fully tracked for attendance/accountability.',
+        f'✅ {member.mention} graduated. Setter accountability begins now.',
         ephemeral=True
     )
+
+
 
 
 @bot.tree.command(name='checkin',description='Check in for the day with a required photo')
