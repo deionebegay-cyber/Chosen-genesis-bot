@@ -293,6 +293,16 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id INTEGER,user_id INTEGER,role_type TEXT,amount INTEGER,
       source_date TEXT,credit_week_key TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS challenges(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,name TEXT,challenge_type TEXT,scope TEXT,metric TEXT,
+      terms TEXT,goal INTEGER,prize TEXT,end_mode TEXT,end_behavior TEXT,
+      deadline_at TEXT,status TEXT DEFAULT 'active',winner_id INTEGER,
+      created_by INTEGER,created_at TEXT,ended_at TEXT,
+      channel_id INTEGER,message_id INTEGER);
+    CREATE TABLE IF NOT EXISTS challenge_participants(
+      challenge_id INTEGER,user_id INTEGER,score INTEGER DEFAULT 0,
+      PRIMARY KEY(challenge_id,user_id));
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -806,11 +816,39 @@ async def weekly_recap(guild,week_key):
     e.add_field(name='📅 Team Appointments',value=f'**{appts}**',inline=True)
     e.add_field(name='💰 Team Sales',value=f'**{sales}**',inline=True)
     e.add_field(name='🔥 Personal Bests',value=f'**{int(pb_count or 0)}** broken',inline=True)
-    e.add_field(name='👑 Setter King',value=f'**{names(setters)}** — {setter_count} setter sales' + (f' • {max((setter_appts.get(x,0) for x in setters),default=0)} appointments' if setters else ''),inline=False)
-    e.add_field(name='👑 Closer King',value=f'**{names(closers)}** — {closer_count} sales',inline=False)
-    e.add_field(name='📄 Most Bills',value=f'**{names(bill_winners)}** — {bill_count}',inline=True)
-    e.add_field(name='⚡ Most Same Days',value=f'**{names(sd_winners)}** — {sd_count}',inline=True)
-    e.add_field(name='🏅 Badges Earned',value=f'**{int((badge_count or 0)+(badge_daily or 0))}**',inline=True)
+    if setters and setter_count>0:
+        e.add_field(
+            name='👑 Setter King',
+            value=f'**{names(setters)}** — {setter_count} setter sales'
+                  + f' • {max((setter_appts.get(x,0) for x in setters),default=0)} appointments',
+            inline=False
+        )
+    if closers and closer_count>0:
+        e.add_field(
+            name='👑 Closer King',
+            value=f'**{names(closers)}** — {closer_count} sales',
+            inline=False
+        )
+    if bill_winners and bill_count>0:
+        e.add_field(
+            name='📄 Most Bills',
+            value=f'**{names(bill_winners)}** — {bill_count}',
+            inline=True
+        )
+    if sd_winners and sd_count>0:
+        e.add_field(
+            name='⚡ Most Same Days',
+            value=f'**{names(sd_winners)}** — {sd_count}',
+            inline=True
+        )
+
+    total_badges=int((badge_count or 0)+(badge_daily or 0))
+    if total_badges>0:
+        e.add_field(
+            name='🏅 Badges Earned',
+            value=f'**{total_badges}**',
+            inline=True
+        )
     e.set_footer(text='New week. Same mission.')
     await main(guild,embed=e)
     meta_set(guild.id,'weekly_recap_posted',week_key)
@@ -927,28 +965,48 @@ async def post_daily_awards(guild,date_obj=None,force=False):
         timestamp=datetime.now(timezone.utc)
     )
 
-    sales_text=(
-        f'💥 **SALE:** {member_names(guild,sale_ids)}\n'
-        f'🥈 **2 SPOT:** {member_names(guild,two_ids)}\n'
-        f'🎩 **HATTRICK:** {member_names(guild,hat_ids)}\n'
-        f'👻 **GHOST HUNTER:** {member_names(guild,ghost_ids)}'
-    )
-    e.add_field(name='💰 SALES BADGES',value=sales_text,inline=False)
+    sales_lines=[]
+    if sale_ids:
+        sales_lines.append(f'💥 **SALE:** {member_names(guild,sale_ids)}')
+    if two_ids:
+        sales_lines.append(f'🥈 **2 SPOT:** {member_names(guild,two_ids)}')
+    if hat_ids:
+        sales_lines.append(f'🎩 **HATTRICK:** {member_names(guild,hat_ids)}')
+    if ghost_ids:
+        sales_lines.append(f'👻 **GHOST HUNTER:** {member_names(guild,ghost_ids)}')
+
+    if sales_lines:
+        e.add_field(
+            name='💰 SALES BADGES',
+            value='\n'.join(sales_lines),
+            inline=False
+        )
 
     point_name=member_names(guild,[point_uid]) if point_uid else 'No winner — nobody reached 2 appointments'
     bounty_ids,bounty_val=quality_badges.get('📄 Bounty Hunter',([],0))
     same_ids,same_val=quality_badges.get('⚡ Same Day Savage',([],0))
     speed_ids,speed_val=quality_badges.get('⏰ Speed Demon',([],0))
 
-    comp_text=(
-        f'🎯 **POINT MAN:** {point_name}' + (f' — {point_count} appointments' if point_uid else '') + '\n'
-        f'📄 **BOUNTY HUNTER:** {member_names(guild,bounty_ids)}' + (f' — {bounty_val} bills' if bounty_ids else '') + '\n'
-        f'⚡ **SAME DAY SAVAGE:** {member_names(guild,same_ids)}' + (f' — {same_val} same-days' if same_ids else '') + '\n'
-        f'⏰ **SPEED DEMON:** {member_names(guild,speed_ids)}' + (f' — {speed_val} within 48 hrs' if speed_ids else '') + '\n'
-        f'🩸 **FIRST BLOOD:** {member_names(guild,[first_uid] if first_uid else [])}\n'
-        f'🦉 **NIGHT OWL:** {member_names(guild,[night_uid] if night_uid else [])}'
-    )
-    e.add_field(name='🎯 DAILY BADGES',value=comp_text,inline=False)
+    comp_lines=[]
+    if point_uid:
+        comp_lines.append(f'🎯 **POINT MAN:** {point_name} — {point_count} appointments')
+    if bounty_ids:
+        comp_lines.append(f'📄 **BOUNTY HUNTER:** {member_names(guild,bounty_ids)} — {bounty_val} bills')
+    if same_ids:
+        comp_lines.append(f'⚡ **SAME DAY SAVAGE:** {member_names(guild,same_ids)} — {same_val} same-days')
+    if speed_ids:
+        comp_lines.append(f'⏰ **SPEED DEMON:** {member_names(guild,speed_ids)} — {speed_val} within 48 hrs')
+    if first_uid:
+        comp_lines.append(f'🩸 **FIRST BLOOD:** {member_names(guild,[first_uid])}')
+    if night_uid:
+        comp_lines.append(f'🦉 **NIGHT OWL:** {member_names(guild,[night_uid])}')
+
+    if comp_lines:
+        e.add_field(
+            name='🎯 DAILY BADGES',
+            value='\n'.join(comp_lines),
+            inline=False
+        )
 
     e.add_field(
         name='📊 CHOSEN GENESIS TODAY',
@@ -1424,81 +1482,153 @@ def week_member_totals(guild,wk,stat):
             out[member.id]=value
     return out
 
-async def send_weekly_manager_summary(guild,week_key):
-    if meta_get(guild.id,'manager_weekly_sent')==week_key:
-        return
 
-    start,end=week_date_bounds_from_key(week_key)
-    prev_end=datetime.strptime(start,'%Y-%m-%d').date()-timedelta(days=1)
-    prev_wk=wkey(prev_end)
+MONTHLY_SETTER_STANDARD = 3
+COACHING_MIN_APPTS = 5
 
-    appts=team_week_total(guild.id,week_key,'appointments')
-    sales=team_week_total(guild.id,week_key,'sales')
+def setter_members(guild):
+    return [
+        m for m in guild.members
+        if not m.bot and any(r.name.lower()=='setter' for r in m.roles)
+    ]
 
-    top_appts=period_rows_between(guild.id,start,end,'appointments',5)
-    top_setter_sales=period_rows_between(guild.id,start,end,'setter_sales',5)
-    top_closer_sales=period_rows_between(guild.id,start,end,'closer_sales',5)
+def setter_period_snapshot(guild,member,start,end):
+    appts=period_total_for_user(guild.id,member.id,'appointments',start,end)
+    sales=period_total_for_user(guild.id,member.id,'sales',start,end)
+    same=period_total_for_user(guild.id,member.id,'same_day',start,end)
+    within=period_total_for_user(guild.id,member.id,'within_48',start,end)
+    bills=period_total_for_user(guild.id,member.id,'bills',start,end)
 
-    # Week-over-week appointment movement.
-    current=week_member_totals(guild,week_key,'appointments')
-    previous=week_member_totals(guild,prev_wk,'appointments')
-    movers=[]
-    for uid in set(current)|set(previous):
-        diff=current.get(uid,0)-previous.get(uid,0)
-        if diff!=0:
-            movers.append((uid,diff,current.get(uid,0),previous.get(uid,0)))
-    movers.sort(key=lambda x:(-x[1],-x[2]))
+    # Same-day appointments are inherently within 48 hours. Protect against
+    # older records where within_48 may not have been marked on a same-day.
+    effective_within=min(appts,max(within,same))
+    over48=max(0,appts-effective_within)
 
-    momentum=[]
-    for uid,diff,cur,prev in movers[:5]:
-        member=guild.get_member(uid)
-        if not member:
-            continue
-        arrow='⬆️' if diff>0 else '⬇️'
-        momentum.append(f'{arrow} **{member.display_name}**: {prev} → {cur} ({diff:+d})')
-    momentum_text='\n'.join(momentum) if momentum else 'No meaningful week-over-week changes.'
+    return {
+        'member':member,
+        'appointments':appts,
+        'sales':sales,
+        'same_day':same,
+        'within_48':effective_within,
+        'over_48':over48,
+        'bills':bills,
+        'conversion':(sales/appts*100.0) if appts else 0.0,
+        'over_48_pct':(over48/appts*100.0) if appts else 0.0,
+        'bill_pct':(bills/appts*100.0) if appts else 0.0,
+    }
 
-    # Low appointment activity only for members who currently have the Setter role.
-    needs=[]
-    for member in guild.members:
-        if member.bot:
-            continue
-        if not any(r.name.lower()=='setter' for r in member.roles):
-            continue
-        val=period_total_for_user(guild.id,member.id,'appointments',start,end)
-        if val<=1:
-            needs.append((member.display_name,val))
-    needs.sort(key=lambda x:(x[1],x[0].lower()))
-    needs_text='\n'.join(f'• **{name}** — {val} appointment{"s" if val!=1 else ""}' for name,val in needs[:8]) or 'No setters at 0–1 appointments.'
+def monthly_pace_status(guild,member,as_of=None):
+    as_of=as_of or now().date()
+    start=as_of.replace(day=1).isoformat()
+    end=as_of.isoformat()
+    sales=period_total_for_user(guild.id,member.id,'sales',start,end)
+    days_in_month=calendar.monthrange(as_of.year,as_of.month)[1]
+    expected=MONTHLY_SETTER_STANDARD*(as_of.day/days_in_month)
 
-    c=con()
-    pb_count=c.execute(
-        'SELECT COUNT(*) c FROM record_events WHERE guild_id=? AND week_key=?',
-        (guild.id,week_key)
-    ).fetchone()['c']
-    badge_start,badge_end=week_date_bounds_from_key(week_key)
-    badge_count=c.execute(
-        'SELECT COUNT(*) c FROM badge_awards WHERE guild_id=? '
-        'AND (award_key=? OR award_key BETWEEN ? AND ?)',
-        (guild.id,week_key,badge_start,badge_end)
-    ).fetchone()['c']
-    c.close()
+    if sales>=MONTHLY_SETTER_STANDARD:
+        label='✅ Standard Hit'
+    elif sales>=expected:
+        label='🟢 On Pace'
+    elif sales+0.5>=expected:
+        label='🟡 Close to Pace'
+    else:
+        label='🔴 Behind Pace'
+    return sales,expected,label
+
+def coaching_diagnosis(s):
+    a=s['appointments']; sales=s['sales']; over=s['over_48_pct']; conv=s['conversion']; bill=s['bill_pct']
+
+    if a<COACHING_MIN_APPTS:
+        if a<=1:
+            return 'Low activity — not enough volume yet to judge conversion.'
+        return 'Limited sample — build more appointment volume before diagnosing conversion.'
+
+    flags=[]
+    if over>=40:
+        flags.append(f'{over:.0f}% of appointments are over 48 hours — focus on pulling appointments closer')
+    elif over>=25:
+        flags.append(f'{over:.0f}% are over 48 hours — appointment timing is worth watching')
+
+    if sales==0:
+        if over<40:
+            flags.append('no closed deals from solid activity — review appointment quality, handoff, and close outcomes')
+        else:
+            flags.append('no closed deals yet — review both appointment timing and close outcomes')
+    elif conv<15:
+        flags.append(f'{conv:.0f}% appointment-to-sale conversion — review quality and close outcomes')
+    elif conv>=35:
+        flags.append(f'strong {conv:.0f}% conversion')
+        if a<8:
+            flags.append('more volume could create a bigger week')
+
+    if bill<50 and a>=5:
+        flags.append(f'only {bill:.0f}% of appointments have bills — review bill collection')
+
+    if not flags:
+        return 'Healthy activity/quality mix — keep monitoring conversion.'
+    return ' • '.join(flags)+'.'
+
+def manager_review_embed(guild,start,end,title,description):
+    snapshots=[setter_period_snapshot(guild,m,start,end) for m in setter_members(guild)]
+    snapshots.sort(key=lambda s:(-s['appointments'],-s['sales'],s['member'].display_name.lower()))
 
     e=discord.Embed(
-        title='📋 CHOSEN GENESIS — WEEKLY MANAGER REPORT',
-        description=f'Private manager report for **{week_key}**.',
+        title=title,
+        description=description,
         timestamp=datetime.now(timezone.utc)
     )
+
+    top=snapshots[:5]
+    top_lines=[]
+    for i,s in enumerate(top,1):
+        medal=['🥇','🥈','🥉'][i-1] if i<=3 else f'#{i}'
+        top_lines.append(
+            f'{medal} **{s["member"].display_name}** — **{s["appointments"]} apps** • {s["sales"]} sales'
+        )
     e.add_field(
-        name='TEAM',
-        value=f'📅 Appointments: **{appts}**\n💰 Sales: **{sales}**\n🏅 Badges Earned: **{int(badge_count or 0)}**\n📈 Personal Bests: **{int(pb_count or 0)}**',
+        name='🏆 TOP 5 APPOINTMENT SETTERS',
+        value='\n'.join(top_lines) if top_lines else 'No setter production yet.',
         inline=False
     )
-    e.add_field(name='📅 TOP 5 APPOINTMENTS',value=fmt_ranked_members(guild,top_appts),inline=False)
-    e.add_field(name='💰 TOP 5 SETTER SALES',value=fmt_ranked_members(guild,top_setter_sales),inline=False)
-    e.add_field(name='🤝 TOP 5 CLOSER SALES',value=fmt_ranked_members(guild,top_closer_sales),inline=False)
-    e.add_field(name='📈 WEEK-OVER-WEEK MOMENTUM',value=momentum_text,inline=False)
-    e.add_field(name='⚠️ LOW SETTER ACTIVITY',value=needs_text,inline=False)
+
+    production_lines=[]
+    for s in snapshots[:10]:
+        if s['appointments']<=0 and s['sales']<=0:
+            continue
+        production_lines.append(
+            f'**{s["member"].display_name}** — {s["appointments"]} apps • {s["sales"]} sales • '
+            f'{s["conversion"]:.0f}% conv\n'
+            f'⚡ {s["same_day"]} same-day • ⏰ {s["within_48"]} ≤48h • '
+            f'📅 {s["over_48"]} >48h ({s["over_48_pct"]:.0f}%) • 📄 {s["bills"]} bills'
+        )
+    e.add_field(
+        name='📊 SETTER QUALITY + CONVERSION',
+        value='\n'.join(production_lines)[:1024] if production_lines else 'No setter production yet.',
+        inline=False
+    )
+
+    diagnosis=[]
+    for s in snapshots:
+        if s['appointments']<=0:
+            continue
+        diagnosis.append(f'**{s["member"].display_name}:** {coaching_diagnosis(s)}')
+    e.add_field(
+        name='🔍 COACHING DIAGNOSIS',
+        value='\n'.join(diagnosis[:8])[:1024] if diagnosis else 'Not enough activity to diagnose yet.',
+        inline=False
+    )
+
+    pace=[]
+    for s in snapshots:
+        sales,expected,label=monthly_pace_status(guild,s['member'])
+        pace.append(
+            f'**{s["member"].display_name}** — {sales}/{MONTHLY_SETTER_STANDARD} deals • {label}'
+        )
+    e.add_field(
+        name=f'🎯 MONTHLY STANDARD — {MONTHLY_SETTER_STANDARD} DEALS',
+        value='\n'.join(pace[:12])[:1024] if pace else 'No setters found.',
+        inline=False
+    )
 
     c=con()
     attendance_rows=c.execute(
@@ -1507,39 +1637,113 @@ async def send_weekly_manager_summary(guild,week_key):
         (guild.id,start,end)
     ).fetchall()
     c.close()
-
-    summary={}
+    attendance={}
     for r in attendance_rows:
-        summary.setdefault(r['user_id'],{})[r['status']]=int(r['c'] or 0)
+        attendance.setdefault(r['user_id'],{})[r['status']]=int(r['c'] or 0)
 
-    attendance_lines=[]
-    for uid,stats in summary.items():
-        m=guild.get_member(uid)
-        if not m:
+    att_lines=[]
+    for s in snapshots:
+        stats=attendance.get(s['member'].id,{})
+        if not stats:
             continue
-        attendance_lines.append(
-            f'**{m.display_name}** — ✅ {stats.get("on_time",0)} on time • '
-            f'⚠️ {stats.get("late",0)} late • ❌ {stats.get("missed",0)} missed'
+        att_lines.append(
+            f'**{s["member"].display_name}** — ✅ {stats.get("on_time",0)} • '
+            f'⚠️ {stats.get("late",0)} • ❌ {stats.get("missed",0)}'
         )
+    if att_lines:
+        e.add_field(name='🕐 ATTENDANCE',value='\n'.join(att_lines)[:1024],inline=False)
 
-    e.add_field(
-        name='🕐 CHECK-IN ACCOUNTABILITY',
-        value='\n'.join(attendance_lines) if attendance_lines else 'No late setter check-ins recorded.',
-        inline=False
-    )
-    e.set_footer(text='Private manager report • Chosen Genesis')
+    watch=[]
+    for s in snapshots:
+        if s['appointments']>=COACHING_MIN_APPTS:
+            if s['over_48_pct']>=40:
+                watch.append(f'📅 **{s["member"].display_name}** — {s["over_48_pct"]:.0f}% of apps are >48h')
+            elif s['sales']==0:
+                watch.append(f'🔎 **{s["member"].display_name}** — {s["appointments"]} apps / 0 sales')
+            elif s['conversion']<15:
+                watch.append(f'📉 **{s["member"].display_name}** — {s["conversion"]:.0f}% conversion')
+            elif s['conversion']>=35 and s['appointments']<8:
+                watch.append(f'📈 **{s["member"].display_name}** — strong conversion; push volume')
+    if watch:
+        e.add_field(name='📌 MANAGER WATCHLIST',value='\n'.join(watch[:8])[:1024],inline=False)
 
+    e.set_footer(text='Private manager intelligence • Chosen Genesis')
+    return e
+
+async def dm_managers(guild,embed):
     managers=[
         m for m in guild.members
         if not m.bot and any(r.name.lower()=='manager' for r in m.roles)
     ]
     for manager in managers:
         try:
-            await manager.send(embed=e)
+            await manager.send(embed=embed)
         except (discord.Forbidden,discord.HTTPException):
             pass
 
-    meta_set(guild.id,'manager_weekly_sent',week_key)
+async def send_midweek_manager_review(guild,force=False):
+    # Thursday review covers Monday through the current moment.
+    today=now().date()
+    start=(today-timedelta(days=today.weekday())).isoformat()
+    end=today.isoformat()
+    key=wkey(today)
+    meta_key='manager_midweek_sent'
+    if meta_get(guild.id,meta_key)==key and not force:
+        return False
+
+    e=manager_review_embed(
+        guild,start,end,
+        '📊 CHOSEN GENESIS — MID-WEEK MANAGER REVIEW',
+        f'Private manager review • **{start} → {end}**\nWhat needs attention before the week closes?'
+    )
+    await dm_managers(guild,e)
+    if not force:
+        meta_set(guild.id,meta_key,key)
+    return True
+
+async def send_weekly_manager_summary(guild,week_key,force=False):
+    if meta_get(guild.id,'manager_weekly_sent')==week_key and not force:
+        return False
+
+    start,end=week_date_bounds_from_key(week_key)
+    prev_end=datetime.strptime(start,'%Y-%m-%d').date()-timedelta(days=1)
+    prev_wk=wkey(prev_end)
+
+    e=manager_review_embed(
+        guild,start,end,
+        '📋 CHOSEN GENESIS — WEEKLY MANAGER REVIEW',
+        f'Private manager review for **{week_key}**.\nProduction, quality, conversion, pace, and accountability.'
+    )
+
+    top_setter_sales=period_rows_between(guild.id,start,end,'setter_sales',5)
+    top_closer_sales=period_rows_between(guild.id,start,end,'closer_sales',5)
+    e.add_field(name='💰 TOP 5 SETTER SALES',value=fmt_ranked_members(guild,top_setter_sales),inline=False)
+    e.add_field(name='🤝 TOP 5 CLOSER SALES',value=fmt_ranked_members(guild,top_closer_sales),inline=False)
+
+    current=week_member_totals(guild,week_key,'appointments')
+    previous=week_member_totals(guild,prev_wk,'appointments')
+    movers=[]
+    for uid in set(current)|set(previous):
+        diff=current.get(uid,0)-previous.get(uid,0)
+        if diff:
+            movers.append((uid,diff,current.get(uid,0),previous.get(uid,0)))
+    movers.sort(key=lambda x:(-x[1],-x[2]))
+
+    momentum=[]
+    for uid,diff,cur,prev in movers[:5]:
+        member=guild.get_member(uid)
+        if member:
+            momentum.append(
+                f'{"⬆️" if diff>0 else "⬇️"} **{member.display_name}**: {prev} → {cur} ({diff:+d})'
+            )
+    if momentum:
+        e.add_field(name='📈 WEEK-OVER-WEEK APPOINTMENT MOMENTUM',value='\n'.join(momentum),inline=False)
+
+    await dm_managers(guild,e)
+    if not force:
+        meta_set(guild.id,'manager_weekly_sent',week_key)
+    return True
+
 
 async def monthly_recap(guild,month_date):
     start,end=month_bounds_for_date(month_date)
@@ -2172,7 +2376,11 @@ async def on_ready():
             except Exception as exc:
                 print(f'[DAILY AWARDS ERROR] guild={g.id} error={type(exc).__name__}: {exc}')
             await refresh_leaderboard(g)
+        if now().weekday()==3 and now().hour>=9:
+            await send_midweek_manager_review(g)
         await weekly_kings(g)
+        # Restore active challenges and their live messages after Railway restarts.
+        await refresh_active_challenges(g)
         if now().weekday()==0:
             prev=now().date()-timedelta(days=1)
             prev_wk=wkey(prev)
@@ -2195,8 +2403,16 @@ async def maintenance():
         if awards_now().weekday()!=6 and awards_now().hour>=22:
             await post_daily_awards(g,awards_now().date())
 
+        # Mid-week manager intelligence: Thursday morning in Arizona.
+        if now().weekday()==3 and now().hour>=9:
+            await send_midweek_manager_review(g)
+
         # Keep cosmetic King roles synced all week.
         await weekly_kings(g)
+
+        # Challenge state lives in SQLite; refresh/evaluate it every cycle so
+        # deadlines and message restoration survive worker restarts.
+        await refresh_active_challenges(g)
         if now().weekday()==0:
             prev=now().date()-timedelta(days=1)
             prev_wk=wkey(prev)
@@ -2211,7 +2427,490 @@ async def maintenance():
 @maintenance.before_loop
 async def before_maintenance(): await bot.wait_until_ready()
 
+
+CHALLENGE_TYPE_CHOICES = [
+    app_commands.Choice(name='Daily',value='daily'),
+    app_commands.Choice(name='Weekly',value='weekly'),
+    app_commands.Choice(name='Custom',value='custom'),
+]
+CHALLENGE_SCOPE_CHOICES = [
+    app_commands.Choice(name='Everyone',value='everyone'),
+    app_commands.Choice(name='All Setters',value='setters'),
+    app_commands.Choice(name='All Closers',value='closers'),
+    app_commands.Choice(name='Selected People',value='selected'),
+]
+CHALLENGE_METRIC_CHOICES = [
+    app_commands.Choice(name='Appointments',value='appointments'),
+    app_commands.Choice(name='Setter Sales',value='setter_sales'),
+    app_commands.Choice(name='Closer Sales',value='closer_sales'),
+    app_commands.Choice(name='Same-Day Appointments',value='same_day'),
+    app_commands.Choice(name='Within 48 Hours',value='within_48'),
+    app_commands.Choice(name='Bills Collected',value='bills'),
+]
+CHALLENGE_END_CHOICES = [
+    app_commands.Choice(name='Manual End',value='manual'),
+    app_commands.Choice(name='Deadline',value='deadline'),
+    app_commands.Choice(name='Goal Reached or Deadline',value='goal_or_deadline'),
+]
+CHALLENGE_BEHAVIOR_CHOICES = [
+    app_commands.Choice(name='Highest Score Wins',value='highest'),
+    app_commands.Choice(name='No Winner if Goal Missed',value='no_winner'),
+]
+
+def challenge_metric_label(metric):
+    return {
+        'appointments':'Appointments',
+        'setter_sales':'Setter Sales',
+        'closer_sales':'Closer Sales',
+        'same_day':'Same-Days',
+        'within_48':'Within 48 Hours',
+        'bills':'Bills Collected',
+    }.get(metric,metric)
+
+def parse_challenge_deadline(date_text,time_text):
+    if not date_text or not time_text:
+        return None
+    try:
+        dt=datetime.strptime(f'{date_text.strip()} {time_text.strip()}','%Y-%m-%d %H:%M')
+        return dt.replace(tzinfo=TZ)
+    except ValueError:
+        return None
+
+def challenge_row(challenge_id,guild_id=None):
+    c=con()
+    if guild_id is None:
+        row=c.execute('SELECT * FROM challenges WHERE id=?',(challenge_id,)).fetchone()
+    else:
+        row=c.execute('SELECT * FROM challenges WHERE id=? AND guild_id=?',(challenge_id,guild_id)).fetchone()
+    c.close()
+    return row
+
+def active_challenges(guild_id):
+    c=con()
+    rows=c.execute(
+        "SELECT * FROM challenges WHERE guild_id=? AND status='active' ORDER BY id ASC",
+        (guild_id,)
+    ).fetchall()
+    c.close()
+    return rows
+
+def challenge_participant_ids(challenge_id):
+    c=con()
+    rows=c.execute(
+        'SELECT user_id FROM challenge_participants WHERE challenge_id=? ORDER BY user_id',
+        (challenge_id,)
+    ).fetchall()
+    c.close()
+    return [r['user_id'] for r in rows]
+
+def challenge_scores(challenge_id):
+    c=con()
+    rows=c.execute(
+        'SELECT user_id,score FROM challenge_participants WHERE challenge_id=? ORDER BY score DESC,user_id ASC',
+        (challenge_id,)
+    ).fetchall()
+    c.close()
+    return [(r['user_id'],int(r['score'] or 0)) for r in rows]
+
+def challenge_member_scope(guild,scope,selected):
+    selected=[m for m in selected if m is not None and not m.bot]
+    if scope=='selected':
+        # preserve order, remove duplicates
+        seen=set(); out=[]
+        for m in selected:
+            if m.id not in seen:
+                seen.add(m.id); out.append(m)
+        return out
+    if scope=='setters':
+        return [m for m in guild.members if not m.bot and any(r.name.lower()=='setter' for r in m.roles)]
+    if scope=='closers':
+        return [m for m in guild.members if not m.bot and any(r.name.lower()=='closer' for r in m.roles)]
+    # Everyone means all non-manager reps with Setter and/or Closer role.
+    return [
+        m for m in guild.members
+        if not m.bot
+        and not any(r.name.lower()=='manager' for r in m.roles)
+        and any(r.name.lower() in {'setter','closer'} for r in m.roles)
+    ]
+
+def challenge_score_line(guild,uid,score,goal=None,index=None):
+    member=guild.get_member(uid)
+    name=member.display_name if member else f'<@{uid}>'
+    prefix=['🥇','🥈','🥉'][index] if index is not None and index<3 else (f'#{index+1}' if index is not None else '•')
+    if goal and goal>0:
+        return f'{prefix} **{name}** — **{score}/{goal}**'
+    return f'{prefix} **{name}** — **{score}**'
+
+async def render_challenge(guild,ch_row,send_if_missing=True):
+    scores=challenge_scores(ch_row['id'])
+    goal=int(ch_row['goal'] or 0)
+    deadline=ch_row['deadline_at']
+    deadline_text='Manual'
+    if deadline:
+        try:
+            dt=datetime.fromisoformat(deadline)
+            deadline_text=dt.astimezone(TZ).strftime('%a %b %d • %-I:%M %p')
+        except Exception:
+            deadline_text=deadline
+
+    scope_label={
+        'everyone':'Everyone',
+        'setters':'All Setters',
+        'closers':'All Closers',
+        'selected':'Selected People'
+    }.get(ch_row['scope'],ch_row['scope'])
+
+    e=discord.Embed(
+        title=f'⚔️ CHOSEN GENESIS CHALLENGE — {ch_row["name"]}',
+        description=(
+            f'**{str(ch_row["challenge_type"]).upper()} • Challenge #{ch_row["id"]}**\n\n'
+            f'👥 **Competitors:** {scope_label}\n'
+            f'📊 **Tracking:** {challenge_metric_label(ch_row["metric"])}\n'
+            f'📜 **Terms:** {ch_row["terms"]}\n'
+            + (f'🎯 **Goal:** {goal}\n' if goal else '')
+            + f'⏰ **Ends:** {deadline_text}\n'
+            + (f'🏆 **Prize:** {ch_row["prize"]}\n' if ch_row['prize'] else '')
+        ),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    if scores:
+        standings='\n'.join(
+            challenge_score_line(guild,uid,score,goal,index=i)
+            for i,(uid,score) in enumerate(scores[:15])
+        )
+    else:
+        standings='No competitors.'
+    e.add_field(name='🔥 CURRENT STANDINGS',value=standings,inline=False)
+    e.set_footer(text='Challenge standings update automatically.')
+
+    ch=None
+    if ch_row['channel_id']:
+        ch=guild.get_channel(int(ch_row['channel_id']))
+    if not ch:
+        ch=await channel(guild,'main-chat')
+    if not ch:
+        return None
+
+    if ch_row['message_id']:
+        try:
+            msg=await ch.fetch_message(int(ch_row['message_id']))
+            await msg.edit(embed=e)
+            return msg
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException,ValueError):
+            pass
+
+    if not send_if_missing:
+        return None
+
+    msg=await ch.send(embed=e)
+    c=con()
+    c.execute(
+        'UPDATE challenges SET channel_id=?,message_id=? WHERE id=?',
+        (ch.id,msg.id,ch_row['id'])
+    )
+    c.commit(); c.close()
+    return msg
+
+def challenge_leaders(challenge_id):
+    scores=challenge_scores(challenge_id)
+    if not scores:
+        return [],0
+    best=scores[0][1]
+    return [uid for uid,score in scores if score==best],best
+
+async def finish_challenge(guild,ch_row,winner_ids=None,reason='complete',no_winner=False):
+    if ch_row['status']!='active':
+        return
+    winner_ids=winner_ids or []
+    winner_id=winner_ids[0] if len(winner_ids)==1 else None
+    c=con()
+    c.execute(
+        "UPDATE challenges SET status='ended',winner_id=?,ended_at=? WHERE id=?",
+        (winner_id,datetime.now(timezone.utc).isoformat(),ch_row['id'])
+    )
+    c.commit(); c.close()
+
+    if no_winner or not winner_ids:
+        result='**No winner.**'
+    else:
+        names=', '.join(
+            (guild.get_member(uid).mention if guild.get_member(uid) else f'<@{uid}>')
+            for uid in winner_ids
+        )
+        result=f'🏆 **Winner:** {names}'
+
+    e=discord.Embed(
+        title=f'🏁 CHALLENGE COMPLETE — {ch_row["name"]}',
+        description=(
+            f'{result}\n\n'
+            f'📜 **Terms:** {ch_row["terms"]}\n'
+            f'📊 **Final metric:** {challenge_metric_label(ch_row["metric"])}'
+            + (f'\n🏆 **Prize:** {ch_row["prize"]}' if ch_row['prize'] else '')
+        ),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_footer(text=f'Challenge #{ch_row["id"]} • {reason}')
+    await main(guild,embed=e)
+
+async def evaluate_challenge(guild,ch_row):
+    if ch_row['status']!='active':
+        return
+    goal=int(ch_row['goal'] or 0)
+    scores=challenge_scores(ch_row['id'])
+
+    # Goal hit: first qualifying score wins immediately.
+    if goal>0 and ch_row['end_mode']=='goal_or_deadline':
+        reached=[(uid,score) for uid,score in scores if score>=goal]
+        if reached:
+            best=max(score for _,score in reached)
+            winners=[uid for uid,score in reached if score==best]
+            await finish_challenge(guild,ch_row,winners,'goal reached')
+            return
+
+    # Deadline reached.
+    if ch_row['deadline_at'] and ch_row['end_mode'] in {'deadline','goal_or_deadline'}:
+        try:
+            deadline=datetime.fromisoformat(ch_row['deadline_at'])
+            if deadline.tzinfo is None:
+                deadline=deadline.replace(tzinfo=TZ)
+            if now()>=deadline.astimezone(TZ):
+                leaders,best=challenge_leaders(ch_row['id'])
+                if ch_row['end_mode']=='goal_or_deadline' and goal>0 and best<goal and ch_row['end_behavior']=='no_winner':
+                    await finish_challenge(guild,ch_row,[],f'deadline reached • top score {best}',no_winner=True)
+                else:
+                    await finish_challenge(guild,ch_row,leaders,'deadline reached')
+                return
+        except Exception:
+            pass
+
+async def update_challenges_for_event(guild,user_id,metric,amount=1):
+    if not user_id or amount<=0:
+        return
+    relevant=[]
+    c=con()
+    for ch in c.execute(
+        "SELECT c.* FROM challenges c JOIN challenge_participants p ON p.challenge_id=c.id "
+        "WHERE c.guild_id=? AND c.status='active' AND c.metric=? AND p.user_id=?",
+        (guild.id,metric,user_id)
+    ).fetchall():
+        relevant.append(ch)
+        c.execute(
+            'UPDATE challenge_participants SET score=score+? WHERE challenge_id=? AND user_id=?',
+            (amount,ch['id'],user_id)
+        )
+    c.commit(); c.close()
+
+    for ch in relevant:
+        fresh=challenge_row(ch['id'],guild.id)
+        await render_challenge(guild,fresh)
+        await evaluate_challenge(guild,fresh)
+
+async def refresh_active_challenges(guild):
+    for ch in active_challenges(guild.id):
+        await render_challenge(guild,ch)
+        await evaluate_challenge(guild,ch)
+
+
 MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
+
+@bot.tree.command(name='midweekreview',description='Manager-only: send the current mid-week intelligence review to manager DMs')
+async def midweekreview(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await send_midweek_manager_review(interaction.guild,force=True)
+    await interaction.followup.send('✅ Mid-week review sent to manager DMs.',ephemeral=True)
+
+
+@bot.tree.command(name='weeklyreview',description='Manager-only: send the current week intelligence review to manager DMs')
+async def weeklyreview(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    wk=wkey(now().date())
+    await send_weekly_manager_summary(interaction.guild,wk,force=True)
+    await interaction.followup.send('✅ Weekly review sent to manager DMs.',ephemeral=True)
+
+
+@bot.tree.command(name='challenge',description='Manager-only: create a Chosen Genesis challenge')
+@app_commands.describe(
+    name='Unique challenge name',
+    challenge_type='Daily, weekly, or custom',
+    competitors='Who is competing?',
+    metric='What stat should the bot track?',
+    terms='Write the challenge rules/terms',
+    goal='Optional number needed to win',
+    prize='Optional prize',
+    end_mode='How the challenge ends',
+    end_behavior='If goal is missed by deadline, what happens?',
+    deadline_date='Optional deadline date: YYYY-MM-DD',
+    deadline_time='Optional deadline time: HH:MM (24-hour Arizona time)',
+    person1='Selected competitor 1',
+    person2='Selected competitor 2',
+    person3='Selected competitor 3',
+    person4='Selected competitor 4',
+    person5='Selected competitor 5'
+)
+@app_commands.choices(
+    challenge_type=CHALLENGE_TYPE_CHOICES,
+    competitors=CHALLENGE_SCOPE_CHOICES,
+    metric=CHALLENGE_METRIC_CHOICES,
+    end_mode=CHALLENGE_END_CHOICES,
+    end_behavior=CHALLENGE_BEHAVIOR_CHOICES
+)
+async def challenge(
+    interaction:discord.Interaction,
+    name:str,
+    challenge_type:app_commands.Choice[str],
+    competitors:app_commands.Choice[str],
+    metric:app_commands.Choice[str],
+    terms:str,
+    end_mode:app_commands.Choice[str],
+    end_behavior:app_commands.Choice[str],
+    goal:int|None=None,
+    prize:str|None=None,
+    deadline_date:str|None=None,
+    deadline_time:str|None=None,
+    person1:discord.Member|None=None,
+    person2:discord.Member|None=None,
+    person3:discord.Member|None=None,
+    person4:discord.Member|None=None,
+    person5:discord.Member|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    scope=competitors.value
+    selected=[person1,person2,person3,person4,person5]
+    members=challenge_member_scope(interaction.guild,scope,selected)
+    if scope=='selected' and not members:
+        return await interaction.followup.send('❌ Select at least one competitor.',ephemeral=True)
+    if not members:
+        return await interaction.followup.send('❌ I could not find any eligible competitors for that scope.',ephemeral=True)
+
+    deadline=None
+    if end_mode.value in {'deadline','goal_or_deadline'}:
+        deadline=parse_challenge_deadline(deadline_date,deadline_time)
+        if deadline is None:
+            return await interaction.followup.send(
+                '❌ This end mode needs both a valid **deadline date (YYYY-MM-DD)** and **time (HH:MM)**.',
+                ephemeral=True
+            )
+        if deadline<=now():
+            return await interaction.followup.send('❌ The deadline must be in the future.',ephemeral=True)
+
+    if end_mode.value=='goal_or_deadline' and (goal is None or goal<=0):
+        return await interaction.followup.send('❌ Goal Reached mode needs a goal greater than 0.',ephemeral=True)
+    if goal is not None and goal<=0:
+        return await interaction.followup.send('❌ Goal must be greater than 0.',ephemeral=True)
+
+    c=con()
+    cur=c.execute(
+        'INSERT INTO challenges(guild_id,name,challenge_type,scope,metric,terms,goal,prize,end_mode,end_behavior,deadline_at,status,created_by,created_at) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            interaction.guild.id,name.strip()[:80],challenge_type.value,scope,metric.value,
+            terms.strip()[:800],goal,prize.strip()[:250] if prize else None,
+            end_mode.value,end_behavior.value,deadline.isoformat() if deadline else None,
+            'active',interaction.user.id,datetime.now(timezone.utc).isoformat()
+        )
+    )
+    challenge_id=cur.lastrowid
+    for member in members:
+        c.execute(
+            'INSERT OR IGNORE INTO challenge_participants(challenge_id,user_id,score) VALUES(?,?,0)',
+            (challenge_id,member.id)
+        )
+    c.commit(); c.close()
+
+    ch_row=challenge_row(challenge_id,interaction.guild.id)
+    await render_challenge(interaction.guild,ch_row)
+    await interaction.followup.send(
+        f'✅ **{name}** created as Challenge **#{challenge_id}** with **{len(members)}** competitor(s).',
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name='challenge_status',description='View the current status of a challenge')
+@app_commands.describe(challenge_id='Challenge number shown on the challenge post')
+async def challenge_status(interaction:discord.Interaction,challenge_id:int):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    ch_row=challenge_row(challenge_id,interaction.guild.id)
+    if not ch_row:
+        return await interaction.followup.send('❌ Challenge not found.',ephemeral=True)
+
+    scores=challenge_scores(challenge_id)
+    goal=int(ch_row['goal'] or 0)
+    lines='\n'.join(
+        challenge_score_line(interaction.guild,uid,score,goal,index=i)
+        for i,(uid,score) in enumerate(scores[:20])
+    ) or 'No competitors.'
+
+    e=discord.Embed(
+        title=f'⚔️ {ch_row["name"]} — Challenge #{challenge_id}',
+        description=f'**Status:** {str(ch_row["status"]).upper()}\n📜 {ch_row["terms"]}',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='CURRENT STANDINGS',value=lines,inline=False)
+    await interaction.followup.send(embed=e,ephemeral=True)
+
+
+@bot.tree.command(name='challenge_end',description='Manager-only: manually end one challenge')
+@app_commands.describe(
+    challenge_id='Challenge number',
+    result='leader, winner, or no_winner',
+    winner='Required only when result is winner'
+)
+@app_commands.choices(result=[
+    app_commands.Choice(name='Declare Current Leader',value='leader'),
+    app_commands.Choice(name='Choose Winner Manually',value='winner'),
+    app_commands.Choice(name='End With No Winner',value='no_winner'),
+])
+async def challenge_end(
+    interaction:discord.Interaction,
+    challenge_id:int,
+    result:app_commands.Choice[str],
+    winner:discord.Member|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    ch_row=challenge_row(challenge_id,interaction.guild.id)
+    if not ch_row:
+        return await interaction.followup.send('❌ Challenge not found.',ephemeral=True)
+    if ch_row['status']!='active':
+        return await interaction.followup.send('⚠️ That challenge is already ended.',ephemeral=True)
+
+    if result.value=='no_winner':
+        await finish_challenge(interaction.guild,ch_row,[],'manager ended',no_winner=True)
+    elif result.value=='winner':
+        if winner is None:
+            return await interaction.followup.send('❌ Choose a winner.',ephemeral=True)
+        if winner.id not in challenge_participant_ids(challenge_id):
+            return await interaction.followup.send('❌ That person is not a competitor in this challenge.',ephemeral=True)
+        await finish_challenge(interaction.guild,ch_row,[winner.id],'manager selected winner')
+    else:
+        leaders,_=challenge_leaders(challenge_id)
+        if not leaders:
+            return await interaction.followup.send('❌ There is no current leader yet.',ephemeral=True)
+        await finish_challenge(interaction.guild,ch_row,leaders,'manager declared current leader')
+
+    await interaction.followup.send(f'✅ Challenge **#{challenge_id}** ended.',ephemeral=True)
+
 
 @bot.tree.command(name='givebadge',description='Manager-only: add a badge to someone’s history/count')
 @app_commands.describe(
@@ -2605,6 +3304,15 @@ async def appointment(
     if within_48_hours: add(g,setter.id,'within_48',1)
     if same_day: add(g,setter.id,'same_day',1)
 
+    # Challenge Mode: one appointment can count toward multiple active challenges.
+    await update_challenges_for_event(interaction.guild,setter.id,'appointments',1)
+    if bill_collected:
+        await update_challenges_for_event(interaction.guild,setter.id,'bills',1)
+    if same_day:
+        await update_challenges_for_event(interaction.guild,setter.id,'same_day',1)
+    if within_48_hours:
+        await update_challenges_for_event(interaction.guild,setter.id,'within_48',1)
+
     title,description=pick_announcement(APPOINTMENT_ANNOUNCEMENTS)
 
     # Keep all team references explicitly as Chosen Genesis.
@@ -2706,6 +3414,10 @@ async def sale(
     add(g,setter.id,'sales',1)
     if not outside_team:
         add(g,closer.id,'closer_sales',1)
+
+    await update_challenges_for_event(interaction.guild,setter.id,'setter_sales',1)
+    if not outside_team:
+        await update_challenges_for_event(interaction.guild,closer.id,'closer_sales',1)
 
     title,description=pick_announcement(SALE_ANNOUNCEMENTS)
     description=description.replace('Genesis','Chosen Genesis').replace('Chosen Chosen Genesis','Chosen Genesis')
