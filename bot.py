@@ -313,6 +313,11 @@ def setup_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id INTEGER,user_id INTEGER,submitted_at TEXT,
       status TEXT DEFAULT 'pending',reviewed_by INTEGER,reviewed_at TEXT);
+    CREATE TABLE IF NOT EXISTS pitch_submissions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,video_url TEXT,filename TEXT,
+      submitted_at TEXT,status TEXT DEFAULT 'pending',
+      reviewed_by INTEGER,reviewed_at TEXT,rejection_reason TEXT);
     ''')
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
@@ -490,6 +495,33 @@ def greenie_progress(guild_id,user_id):
     c.close()
     return row
 
+def latest_pitch_submission(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        'SELECT * FROM pitch_submissions WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 1',
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return row
+
+def pending_pitch_submission(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        "SELECT * FROM pitch_submissions WHERE guild_id=? AND user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return row
+
+def pitch_history_count(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        'SELECT COUNT(*) c FROM pitch_submissions WHERE guild_id=? AND user_id=?',
+        (guild_id,user_id)
+    ).fetchone()
+    c.close()
+    return int(row['c'] or 0)
+
 def approved_bootcamp_count(guild_id,user_id):
     c=con()
     row=c.execute(
@@ -539,6 +571,8 @@ def greenie_status_embed(guild,member):
     pitch_approved=bool(int(p['pitch_approved'] or 0))
     requested=bool(int(p['graduation_requested'] or 0))
     ready=approved>=3 and pitch_approved
+    pitch_attempts=pitch_history_count(guild.id,member.id)
+    latest_pitch=latest_pitch_submission(guild.id,member.id)
 
     next_steps=[]
     if approved<3:
@@ -563,8 +597,14 @@ def greenie_status_embed(guild,member):
             f'Bootcamps: **{approved}/3 approved**'
             + (f' • **{pending} pending**' if pending else '') + '\n'
             f'Pitch Submitted: **{"✅" if pitch_submitted else "❌"}**\n'
+            f'Pitch Attempts: **{pitch_attempts}**\n'
             f'Pitch Approved: **{"✅" if pitch_approved else "❌"}**\n'
-            f'Graduation Request: **{"✅ Submitted" if requested else "Not submitted"}**'
+            + (
+                f'Latest Pitch: **Rejected** — {latest_pitch["rejection_reason"]}\n'
+                if latest_pitch and latest_pitch['status']=='rejected' and latest_pitch['rejection_reason']
+                else ''
+            )
+            + f'Graduation Request: **{"✅ Submitted" if requested else "Not submitted"}**'
         ),
         inline=False
     )
@@ -3328,6 +3368,13 @@ async def bootcamp_submit(interaction:discord.Interaction):
     if approved_bootcamp_count(interaction.guild.id,interaction.user.id)>=3:
         return await interaction.response.send_message('✅ You already have all **3/3 approved bootcamps**.',ephemeral=True)
 
+    # One pending bootcamp at a time prevents duplicate submissions/spam.
+    if pending_bootcamp_count(interaction.guild.id,interaction.user.id)>0:
+        return await interaction.response.send_message(
+            '⏳ You already have a **pending bootcamp** waiting for Manager approval.',
+            ephemeral=True
+        )
+
     c=con()
     c.execute(
         "INSERT INTO bootcamp_submissions(guild_id,user_id,submitted_at,status) VALUES(?,?,?,'pending')",
@@ -3388,21 +3435,47 @@ async def pitchvideo(interaction:discord.Interaction,video:discord.Attachment):
     if not is_greenie(interaction.user):
         return await interaction.response.send_message('❌ This command is for members with the **Greenie** role.',ephemeral=True)
 
+    if pending_pitch_submission(interaction.guild.id,interaction.user.id):
+        return await interaction.response.send_message(
+            '⏳ You already have a **pitch waiting for Manager review**. Wait for approval/rejection before submitting another.',
+            ephemeral=True
+        )
+
     ensure_greenie_progress(interaction.guild.id,interaction.user.id)
+    submitted_at=datetime.now(timezone.utc).isoformat()
+
     c=con()
+    cur=c.execute(
+        "INSERT INTO pitch_submissions(guild_id,user_id,video_url,filename,submitted_at,status) "
+        "VALUES(?,?,?,?,?,'pending')",
+        (interaction.guild.id,interaction.user.id,video.url,video.filename,submitted_at)
+    )
+    submission_id=cur.lastrowid
+
+    # Current-status table points at newest submission, but history remains intact.
     c.execute(
-        'UPDATE greenie_progress SET pitch_url=?,pitch_filename=?,pitch_submitted_at=?,pitch_approved=0,pitch_approved_by=NULL,pitch_approved_at=NULL '
+        'UPDATE greenie_progress SET pitch_url=?,pitch_filename=?,pitch_submitted_at=?,'
+        'pitch_approved=0,pitch_approved_by=NULL,pitch_approved_at=NULL,'
+        'graduation_requested=0,graduation_requested_at=NULL '
         'WHERE guild_id=? AND user_id=?',
-        (video.url,video.filename,datetime.now(timezone.utc).isoformat(),interaction.guild.id,interaction.user.id)
+        (video.url,video.filename,submitted_at,interaction.guild.id,interaction.user.id)
     )
     c.commit(); c.close()
 
-    await interaction.response.send_message('🎥 Pitch submitted for **Manager approval**.',ephemeral=True)
+    await interaction.response.send_message(
+        f'🎥 Pitch **#{submission_id}** submitted for **Manager approval**.',
+        ephemeral=True
+    )
+
     ch=await bootcamp_channel(interaction.guild)
     if ch:
         e=discord.Embed(
             title='🎥 PITCH APPROVAL NEEDED',
-            description=f'{interaction.user.mention} submitted a pitch video.\n**File:** {video.filename}',
+            description=(
+                f'{interaction.user.mention} submitted pitch **#{submission_id}**.\n'
+                f'**File:** {video.filename}\n'
+                f'**Attempt:** {pitch_history_count(interaction.guild.id,interaction.user.id)}'
+            ),
             timestamp=datetime.now(timezone.utc)
         )
         e.add_field(name='Video',value=video.url,inline=False)
@@ -3410,23 +3483,93 @@ async def pitchvideo(interaction:discord.Interaction,video:discord.Attachment):
 
 
 @bot.tree.command(name='approvepitch',description='Manager-only: approve a Greenie pitch video')
-@app_commands.describe(member='Greenie whose pitch you are approving')
+@app_commands.describe(member='Greenie whose pending pitch you are approving')
 async def approvepitch(interaction:discord.Interaction,member:discord.Member):
     if not interaction.guild:
         return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
     if not is_manager(interaction.user):
         return await interaction.response.send_message('❌ Only Managers can approve pitch videos.',ephemeral=True)
-    p=greenie_progress(interaction.guild.id,member.id)
-    if not p['pitch_url']:
-        return await interaction.response.send_message('❌ That Greenie has not submitted a pitch video.',ephemeral=True)
+    if not is_greenie(member):
+        return await interaction.response.send_message('❌ That member is not currently a Greenie.',ephemeral=True)
+
+    submission=pending_pitch_submission(interaction.guild.id,member.id)
+    if not submission:
+        return await interaction.response.send_message('❌ That Greenie has no pending pitch submission.',ephemeral=True)
+
+    reviewed_at=datetime.now(timezone.utc).isoformat()
+    c=con()
+    c.execute(
+        "UPDATE pitch_submissions SET status='approved',reviewed_by=?,reviewed_at=?,rejection_reason=NULL WHERE id=?",
+        (interaction.user.id,reviewed_at,submission['id'])
+    )
+    c.execute(
+        'UPDATE greenie_progress SET pitch_url=?,pitch_filename=?,pitch_submitted_at=?,'
+        'pitch_approved=1,pitch_approved_by=?,pitch_approved_at=? '
+        'WHERE guild_id=? AND user_id=?',
+        (
+            submission['video_url'],submission['filename'],submission['submitted_at'],
+            interaction.user.id,reviewed_at,interaction.guild.id,member.id
+        )
+    )
+    c.commit(); c.close()
+
+    await interaction.response.send_message(
+        f'✅ {member.mention}’s pitch **#{submission["id"]}** is approved.',
+        ephemeral=True
+    )
+    await post_greenie_status(interaction.guild,member)
+
+
+@bot.tree.command(name='rejectpitch',description='Manager-only: reject a Greenie pitch and give a reason')
+@app_commands.describe(
+    member='Greenie whose pending pitch you are rejecting',
+    reason='What they need to fix before resubmitting'
+)
+async def rejectpitch(interaction:discord.Interaction,member:discord.Member,reason:str):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only Managers can reject pitch videos.',ephemeral=True)
+    if not is_greenie(member):
+        return await interaction.response.send_message('❌ That member is not currently a Greenie.',ephemeral=True)
+
+    submission=pending_pitch_submission(interaction.guild.id,member.id)
+    if not submission:
+        return await interaction.response.send_message('❌ That Greenie has no pending pitch submission.',ephemeral=True)
+
+    reviewed_at=datetime.now(timezone.utc).isoformat()
+    clean_reason=reason.strip()[:500]
 
     c=con()
     c.execute(
-        'UPDATE greenie_progress SET pitch_approved=1,pitch_approved_by=?,pitch_approved_at=? WHERE guild_id=? AND user_id=?',
-        (interaction.user.id,datetime.now(timezone.utc).isoformat(),interaction.guild.id,member.id)
+        "UPDATE pitch_submissions SET status='rejected',reviewed_by=?,reviewed_at=?,rejection_reason=? WHERE id=?",
+        (interaction.user.id,reviewed_at,clean_reason,submission['id'])
+    )
+    c.execute(
+        'UPDATE greenie_progress SET pitch_approved=0,pitch_approved_by=NULL,pitch_approved_at=NULL '
+        'WHERE guild_id=? AND user_id=?',
+        (interaction.guild.id,member.id)
     )
     c.commit(); c.close()
-    await interaction.response.send_message(f'✅ {member.mention}’s pitch is approved.',ephemeral=True)
+
+    await interaction.response.send_message(
+        f'✅ Pitch **#{submission["id"]}** rejected. {member.mention} can now submit a new version.',
+        ephemeral=True
+    )
+
+    ch=await bootcamp_channel(interaction.guild)
+    if ch:
+        e=discord.Embed(
+            title='🔁 PITCH NEEDS WORK',
+            description=(
+                f'{member.mention} — pitch **#{submission["id"]}** was not approved.\n\n'
+                f'**Manager feedback:** {clean_reason}\n\n'
+                f'Use `/pitchvideo` when the updated pitch is ready.'
+            ),
+            timestamp=datetime.now(timezone.utc)
+        )
+        await ch.send(embed=e)
+
     await post_greenie_status(interaction.guild,member)
 
 
@@ -3495,6 +3638,13 @@ async def graduation(interaction:discord.Interaction,member:discord.Member):
             f'❌ {member.mention} has not completed the graduation requirements.\n'
             f'🏕️ Bootcamps: **{bootcamps}/3**\n'
             f'🎥 Pitch approved: **{"Yes" if int(p["pitch_approved"] or 0) else "No"}**',
+            ephemeral=True
+        )
+
+    if not int(p['graduation_requested'] or 0):
+        return await interaction.followup.send(
+            f'⏳ {member.mention} has completed the training requirements, but they still need to use '
+            f'**/graduation_request** before a Manager can graduate them.',
             ephemeral=True
         )
 
