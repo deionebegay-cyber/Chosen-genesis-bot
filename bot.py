@@ -281,6 +281,15 @@ def setup_db():
       guild_id INTEGER,user_id INTEGER,local_date TEXT,local_time TEXT,
       photo_url TEXT,photo_filename TEXT,created_at TEXT,
       UNIQUE(guild_id,user_id,local_date));
+    CREATE TABLE IF NOT EXISTS checkouts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id INTEGER,user_id INTEGER,local_date TEXT,local_time TEXT,
+      photo_url TEXT,photo_filename TEXT,created_at TEXT,
+      UNIQUE(guild_id,user_id,local_date));
+    CREATE TABLE IF NOT EXISTS checkout_records(
+      guild_id INTEGER,user_id INTEGER,local_date TEXT,status TEXT,
+      checkout_time TEXT,created_at TEXT,
+      PRIMARY KEY(guild_id,user_id,local_date));
     CREATE TABLE IF NOT EXISTS member_state(
       guild_id INTEGER,user_id INTEGER,joined_date TEXT,
       onboarding INTEGER DEFAULT 1,graduated_date TEXT,
@@ -373,6 +382,71 @@ def today_checkins(guild_id):
     ).fetchall()
     c.close()
     return rows
+
+CHECKOUT_EARLIEST_HOUR=19
+CHECKOUT_EARLIEST_MINUTE=50
+
+def get_today_checkout(guild_id,user_id):
+    c=con()
+    row=c.execute(
+        'SELECT * FROM checkouts WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild_id,user_id,dkey())
+    ).fetchone()
+    c.close()
+    return row
+
+def today_checkouts(guild_id):
+    c=con()
+    rows=c.execute(
+        'SELECT * FROM checkouts WHERE guild_id=? AND local_date=? ORDER BY id ASC',
+        (guild_id,dkey())
+    ).fetchall()
+    c.close()
+    return rows
+
+def checkout_is_open(dt=None):
+    dt=dt or now()
+    return minutes_since_midnight(dt.hour,dt.minute) >= minutes_since_midnight(
+        CHECKOUT_EARLIEST_HOUR,CHECKOUT_EARLIEST_MINUTE
+    )
+
+def upsert_checkout_record(guild,member,date_text,status,checkout_time=None):
+    # Only graduated Setters are held accountable for checkout.
+    try:
+        day=datetime.strptime(date_text,'%Y-%m-%d').date()
+    except ValueError:
+        return
+    if not is_workday(day) or is_greenie(member) or not has_named_role(member,'Setter'):
+        return
+
+    c=con()
+    c.execute(
+        'INSERT INTO checkout_records(guild_id,user_id,local_date,status,checkout_time,created_at) '
+        'VALUES(?,?,?,?,?,?) '
+        'ON CONFLICT(guild_id,user_id,local_date) DO UPDATE SET '
+        'status=excluded.status,checkout_time=excluded.checkout_time',
+        (
+            guild.id,member.id,date_text,status,checkout_time,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+    c.commit(); c.close()
+
+def finalize_missed_checkouts_for_date(guild,date_obj):
+    if not is_workday(date_obj):
+        return
+    date_text=date_obj.isoformat()
+    for member in guild.members:
+        if member.bot or not has_named_role(member,'Setter') or is_greenie(member):
+            continue
+        c=con()
+        row=c.execute(
+            'SELECT 1 FROM checkouts WHERE guild_id=? AND user_id=? AND local_date=? LIMIT 1',
+            (guild.id,member.id,date_text)
+        ).fetchone()
+        c.close()
+        if not row:
+            upsert_checkout_record(guild,member,date_text,'missed',None)
 
 
 def ensure_member_state(guild_id,user_id,joined_date=None):
@@ -2650,6 +2724,7 @@ async def on_ready():
         await refresh_leaderboard(g)
         if awards_now().weekday()!=6 and awards_now().hour>=22:
             finalize_missed_checkins_for_date(g,awards_now().date())
+            finalize_missed_checkouts_for_date(g,awards_now().date())
             try:
                 posted=await post_daily_awards(g,awards_now().date())
                 if posted:
@@ -2682,6 +2757,7 @@ async def maintenance():
         # Finalize and announce the day's badges at 10 PM Arizona time.
         # Sunday is skipped as the bot's existing workday logic treats it as off.
         if awards_now().weekday()!=6 and awards_now().hour>=22:
+            finalize_missed_checkouts_for_date(g,awards_now().date())
             await post_daily_awards(g,awards_now().date())
 
         # Mid-week manager intelligence: Thursday morning in Arizona.
@@ -2993,6 +3069,52 @@ async def refresh_active_challenges(guild):
         await evaluate_challenge(guild,ch)
 
 
+
+BADGE_REPORT_PERIOD_CHOICES = [
+    app_commands.Choice(name='This Week',value='this_week'),
+    app_commands.Choice(name='Last Week',value='last_week'),
+    app_commands.Choice(name='This Month',value='this_month'),
+    app_commands.Choice(name='Last Month',value='last_month'),
+]
+
+def badge_report_bounds(period):
+    today=now().date()
+    if period=='this_week':
+        start=today-timedelta(days=today.weekday()); end=today; label='THIS WEEK'
+    elif period=='last_week':
+        this_start=today-timedelta(days=today.weekday())
+        end=this_start-timedelta(days=1); start=end-timedelta(days=6); label='LAST WEEK'
+    elif period=='this_month':
+        start=today.replace(day=1); end=today; label='THIS MONTH'
+    else:
+        this_start=today.replace(day=1)
+        end=this_start-timedelta(days=1); start=end.replace(day=1); label='LAST MONTH'
+    return start.isoformat(),end.isoformat(),label
+
+def badge_counts_between(guild_id,user_id,start_date,end_date):
+    c=con()
+    rows=c.execute(
+        'SELECT badge_name,COUNT(*) c FROM badge_awards '
+        'WHERE guild_id=? AND user_id=? AND (award_key BETWEEN ? AND ? OR created_at BETWEEN ? AND ?) '
+        'GROUP BY badge_name',
+        (guild_id,user_id,start_date,end_date,f'{start_date}T00:00:00',f'{end_date}T23:59:59.999999')
+    ).fetchall()
+    c.close()
+    return {r['badge_name']:int(r['c'] or 0) for r in rows}
+
+def all_badge_totals_between(guild,start_date,end_date):
+    out=[]
+    for member in guild.members:
+        if member.bot:
+            continue
+        counts=badge_counts_between(guild.id,member.id,start_date,end_date)
+        total=sum(counts.values())
+        if total:
+            out.append((member,total,counts))
+    out.sort(key=lambda x:(-x[1],x[0].display_name.lower()))
+    return out
+
+
 MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
 
 @bot.tree.command(name='midweekreview',description='Manager-only: send the current mid-week intelligence review to manager DMs')
@@ -3192,6 +3314,49 @@ async def challenge_end(
 
     await interaction.followup.send(f'✅ Challenge **#{challenge_id}** ended.',ephemeral=True)
 
+
+
+@bot.tree.command(name='badges',description='Manager-only: privately view badge totals by period')
+@app_commands.describe(period='Choose the time period',member='Optional: choose one person. Leave blank to see everyone.')
+@app_commands.choices(period=BADGE_REPORT_PERIOD_CHOICES)
+async def badges(interaction:discord.Interaction,period:app_commands.Choice[str],member:discord.Member|None=None):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    start,end,label=badge_report_bounds(period.value)
+
+    if member is not None:
+        counts=badge_counts_between(interaction.guild.id,member.id,start,end)
+        total=sum(counts.values())
+        lines=[f'**{badge}** — {count}' for badge,count in sorted(counts.items(),key=lambda x:(-x[1],x[0]))]
+
+        e=discord.Embed(
+            title=f'🏅 {member.display_name.upper()} — BADGES',
+            description=f'**{label}** • {start} → {end}',
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(name='TOTAL',value=f'**{total} badge{"s" if total!=1 else ""}**',inline=False)
+        e.add_field(name='BREAKDOWN',value='\n'.join(lines) if lines else 'No badges earned in this period.',inline=False)
+        e.set_footer(text='Private Manager View • Chosen Genesis')
+        return await interaction.followup.send(embed=e,ephemeral=True)
+
+    results=all_badge_totals_between(interaction.guild,start,end)
+    ranking=[]
+    for i,(m,total,_) in enumerate(results[:20],1):
+        prefix=['🥇','🥈','🥉'][i-1] if i<=3 else f'#{i}'
+        ranking.append(f'{prefix} **{m.display_name}** — **{total}**')
+
+    e=discord.Embed(
+        title='🏆 CHOSEN GENESIS — BADGE TOTALS',
+        description=f'**{label}** • {start} → {end}',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name='ALL REPS',value='\n'.join(ranking) if ranking else 'No badges earned in this period.',inline=False)
+    e.set_footer(text='Private Manager View • Add a member to /badges for a breakdown')
+    await interaction.followup.send(embed=e,ephemeral=True)
 
 @bot.tree.command(name='givebadge',description='Manager-only: add a badge to someone’s history/count')
 @app_commands.describe(
@@ -3858,6 +4023,148 @@ async def checkins(interaction:discord.Interaction):
     await interaction.followup.send(embed=e,ephemeral=True)
 
 
+
+
+@bot.tree.command(name='checkout',description='Check out for the day with a required photo')
+@app_commands.describe(photo='Upload your checkout photo')
+async def checkout(interaction:discord.Interaction,photo:discord.Attachment):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+
+    if not is_image_attachment(photo):
+        return await interaction.response.send_message(
+            '❌ Your checkout must include an image/photo.',
+            ephemeral=True
+        )
+
+    existing=get_today_checkout(interaction.guild.id,interaction.user.id)
+    if existing:
+        return await interaction.response.send_message(
+            f'✅ You already checked out today at **{existing["local_time"]}**.',
+            ephemeral=True
+        )
+
+    n=now()
+
+    # 7:50 PM is the earliest valid checkout for graduated Setters.
+    if has_named_role(interaction.user,'Setter') and not is_greenie(interaction.user) and not checkout_is_open(n):
+        return await interaction.response.send_message(
+            '⏰ Setter checkout opens at **7:50 PM**. A checkout before then does not count.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    local_date=n.date().isoformat()
+    local_time=n.strftime('%-I:%M %p')
+
+    c=con()
+    try:
+        c.execute(
+            'INSERT INTO checkouts(guild_id,user_id,local_date,local_time,photo_url,photo_filename,created_at) '
+            'VALUES(?,?,?,?,?,?,?)',
+            (
+                interaction.guild.id,interaction.user.id,local_date,local_time,
+                photo.url,photo.filename,datetime.now(timezone.utc).isoformat()
+            )
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close()
+        return await interaction.followup.send('✅ You already checked out today.',ephemeral=True)
+    c.close()
+
+    # Greenies can participate in the photo ritual, but only Setters are tracked.
+    if has_named_role(interaction.user,'Setter') and not is_greenie(interaction.user) and is_workday(n.date()):
+        upsert_checkout_record(
+            interaction.guild,interaction.user,local_date,'completed',local_time
+        )
+
+    e=discord.Embed(
+        title='🌙 CHOSEN GENESIS — CHECK OUT',
+        description=(
+            f'✅ **{interaction.user.mention} checked out**\n'
+            f'🕐 **{local_time}**\n\n'
+            '**Day in the books. 🔥**'
+        ),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_image(url=photo.url)
+    e.set_footer(text='Chosen Genesis')
+
+    await main(interaction.guild,embed=e)
+    await interaction.followup.send(
+        f'✅ Checkout recorded for **{local_time}**.',
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name='checkouts',description='Manager-only: see today’s setter checkouts')
+async def checkouts(interaction:discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_workday(now().date()):
+        e=discord.Embed(
+            title='🌙 CHOSEN GENESIS — TODAY’S CHECKOUTS',
+            description='☀️ **Sunday is an off day. No checkout accountability today.**',
+            timestamp=datetime.now(timezone.utc)
+        )
+        return await interaction.followup.send(embed=e,ephemeral=True)
+
+    rows=today_checkouts(interaction.guild.id)
+    by_user={r['user_id']:r for r in rows}
+    setters=[
+        m for m in interaction.guild.members
+        if not m.bot and has_named_role(m,'Setter') and not is_greenie(m)
+    ]
+
+    completed=[]
+    pending=[]
+    missed=[]
+    after_finalization=now().hour>=22
+
+    for member in setters:
+        row=by_user.get(member.id)
+        if row:
+            completed.append(f'✅ **{member.display_name}** — {row["local_time"]}')
+        elif after_finalization:
+            missed.append(f'❌ **{member.display_name}**')
+            upsert_checkout_record(interaction.guild,member,dkey(),'missed',None)
+        else:
+            pending.append(f'⏳ **{member.display_name}**')
+
+    e=discord.Embed(
+        title='🌙 CHOSEN GENESIS — TODAY’S SETTER CHECKOUTS',
+        description='Setter checkout opens at **7:50 PM**.',
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(
+        name='✅ CHECKED OUT',
+        value='\n'.join(completed) if completed else 'None yet.',
+        inline=False
+    )
+    if pending:
+        e.add_field(
+            name='⏳ NOT CHECKED OUT YET',
+            value='\n'.join(pending),
+            inline=False
+        )
+    if missed:
+        e.add_field(
+            name='❌ MISSED CHECKOUT',
+            value='\n'.join(missed),
+            inline=False
+        )
+    e.set_footer(text='Private manager view • Chosen Genesis')
+    await interaction.followup.send(embed=e,ephemeral=True)
 
 
 @bot.tree.command(name='appointment',description='Log a new appointment')
