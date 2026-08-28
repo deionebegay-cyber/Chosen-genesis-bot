@@ -4046,12 +4046,22 @@ async def checkout(interaction:discord.Interaction,photo:discord.Attachment):
 
     n=now()
 
-    # 7:50 PM is the earliest valid checkout for graduated Setters.
-    if has_named_role(interaction.user,'Setter') and not is_greenie(interaction.user) and not checkout_is_open(n):
-        return await interaction.response.send_message(
-            '⏰ Setter checkout opens at **7:50 PM**. A checkout before then does not count.',
-            ephemeral=True
+    # Earned Freedom Setters (4+ setter deals last month) can check out at 4:00 PM.
+    # All other graduated Setters can check out at 7:50 PM.
+    if has_named_role(interaction.user,'Setter') and not is_greenie(interaction.user):
+        earned_freedom=has_earned_freedom(interaction.guild.id,interaction.user.id)
+        earliest_minutes=minutes_since_midnight(16,0) if earned_freedom else minutes_since_midnight(
+            CHECKOUT_EARLIEST_HOUR,CHECKOUT_EARLIEST_MINUTE
         )
+        current_minutes=minutes_since_midnight(n.hour,n.minute)
+
+        if current_minutes < earliest_minutes:
+            cutoff='4:00 PM' if earned_freedom else '7:50 PM'
+            freedom_note=' 🔓 Earned Freedom' if earned_freedom else ''
+            return await interaction.response.send_message(
+                f'⏰ Your checkout opens at **{cutoff}**.{freedom_note}',
+                ephemeral=True
+            )
 
     await interaction.response.defer(ephemeral=True)
 
@@ -4143,7 +4153,7 @@ async def checkouts(interaction:discord.Interaction):
 
     e=discord.Embed(
         title='🌙 CHOSEN GENESIS — TODAY’S SETTER CHECKOUTS',
-        description='Setter checkout opens at **7:50 PM**.',
+        description='Regular Setter: **7:50 PM** • 🔓 Earned Freedom (4+ deals last month): **4:00 PM**.',
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(
