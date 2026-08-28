@@ -1976,14 +1976,22 @@ async def dm_managers(guild,embed):
         m for m in guild.members
         if not m.bot and any(r.name.lower()=='manager' for r in m.roles)
     ]
+    delivered=[]
+    failed=[]
     for manager in managers:
         try:
             await manager.send(embed=embed)
-        except (discord.Forbidden,discord.HTTPException):
-            pass
+            delivered.append(manager.id)
+        except (discord.Forbidden,discord.HTTPException) as exc:
+            failed.append(manager.id)
+            print(
+                f'[MANAGER DM ERROR] guild={guild.id} manager={manager.id} '
+                f'error={type(exc).__name__}: {exc}'
+            )
+    return delivered,failed
 
 async def send_midweek_manager_review(guild,force=False):
-    # Thursday review covers Monday through the current moment.
+    # Wednesday end-of-day review covers Monday through the current moment.
     today=now().date()
     start=(today-timedelta(days=today.weekday())).isoformat()
     end=today.isoformat()
@@ -1997,10 +2005,15 @@ async def send_midweek_manager_review(guild,force=False):
         '📊 CHOSEN GENESIS — MID-WEEK MANAGER REVIEW',
         f'Private manager review • **{start} → {end}**\nWhat needs attention before the week closes?'
     )
-    await dm_managers(guild,e)
-    if not force:
+    delivered,failed=await dm_managers(guild,e)
+    if delivered and not force:
         meta_set(guild.id,meta_key,key)
-    return True
+    return {
+        'sent':bool(delivered),
+        'delivered':len(delivered),
+        'failed':len(failed),
+        'embed':e
+    }
 
 async def send_weekly_manager_summary(guild,week_key,force=False):
     if meta_get(guild.id,'manager_weekly_sent')==week_key and not force:
@@ -2040,10 +2053,15 @@ async def send_weekly_manager_summary(guild,week_key,force=False):
     if momentum:
         e.add_field(name='📈 WEEK-OVER-WEEK APPOINTMENT MOMENTUM',value='\n'.join(momentum),inline=False)
 
-    await dm_managers(guild,e)
-    if not force:
+    delivered,failed=await dm_managers(guild,e)
+    if delivered and not force:
         meta_set(guild.id,'manager_weekly_sent',week_key)
-    return True
+    return {
+        'sent':bool(delivered),
+        'delivered':len(delivered),
+        'failed':len(failed),
+        'embed':e
+    }
 
 
 async def monthly_recap(guild,month_date):
@@ -2732,7 +2750,8 @@ async def on_ready():
             except Exception as exc:
                 print(f'[DAILY AWARDS ERROR] guild={g.id} error={type(exc).__name__}: {exc}')
             await refresh_leaderboard(g)
-        if now().weekday()==3 and now().hour>=9:
+        # Mid-week report: Wednesday at 10:00 PM Arizona time.
+        if now().weekday()==2 and now().hour>=22:
             await send_midweek_manager_review(g)
         await weekly_kings(g)
         # Restore active challenges and their live messages after Railway restarts.
@@ -2760,8 +2779,8 @@ async def maintenance():
             finalize_missed_checkouts_for_date(g,awards_now().date())
             await post_daily_awards(g,awards_now().date())
 
-        # Mid-week manager intelligence: Thursday morning in Arizona.
-        if now().weekday()==3 and now().hour>=9:
+        # Mid-week manager intelligence: Wednesday at 10:00 PM Arizona time.
+        if now().weekday()==2 and now().hour>=22:
             await send_midweek_manager_review(g)
 
         # Keep cosmetic King roles synced all week.
@@ -3115,7 +3134,165 @@ def all_badge_totals_between(guild,start_date,end_date):
     return out
 
 
+
+TEAM_REPORT_PERIOD_CHOICES = [
+    app_commands.Choice(name='This Week',value='this_week'),
+    app_commands.Choice(name='Last Week',value='last_week'),
+    app_commands.Choice(name='This Month',value='this_month'),
+    app_commands.Choice(name='Last Month',value='last_month'),
+]
+
+def team_report_bounds(period):
+    today=now().date()
+    if period=='this_week':
+        start=today-timedelta(days=today.weekday())
+        end=today
+        label='THIS WEEK'
+    elif period=='last_week':
+        this_start=today-timedelta(days=today.weekday())
+        end=this_start-timedelta(days=1)
+        start=end-timedelta(days=6)
+        label='LAST WEEK'
+    elif period=='this_month':
+        start=today.replace(day=1)
+        end=today
+        label='THIS MONTH'
+    else:
+        this_start=today.replace(day=1)
+        end=this_start-timedelta(days=1)
+        start=end.replace(day=1)
+        label='LAST MONTH'
+    return start.isoformat(),end.isoformat(),label
+
+def team_quality_totals(guild_id,start,end):
+    c=con()
+    r=c.execute(
+        'SELECT COUNT(*) appts,'
+        'COALESCE(SUM(same_day),0) same_day,'
+        'COALESCE(SUM(within_48),0) within_48,'
+        'COALESCE(SUM(bill_collected),0) bills '
+        'FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild_id,start,end)
+    ).fetchone()
+    sales=c.execute(
+        'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild_id,start,end)
+    ).fetchone()['c']
+    closer_sales=c.execute(
+        'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND closer_id>0 AND local_date BETWEEN ? AND ?',
+        (guild_id,start,end)
+    ).fetchone()['c']
+    c.close()
+
+    appts=int(r['appts'] or 0)
+    same_day=int(r['same_day'] or 0)
+    within_48=int(r['within_48'] or 0)
+    bills=int(r['bills'] or 0)
+    over_48=max(0,appts-within_48)
+
+    return {
+        'appointments':appts,
+        'setter_sales':int(sales or 0),
+        'closer_sales':int(closer_sales or 0),
+        'same_day':same_day,
+        'within_48':within_48,
+        'over_48':over_48,
+        'bills':bills,
+    }
+
+def pct(n,d):
+    return 0 if not d else round((n/d)*100)
+
+
 MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
+
+
+@bot.tree.command(name='teamreport',description='Manager-only: instantly view team performance')
+@app_commands.describe(period='Choose the report period')
+@app_commands.choices(period=TEAM_REPORT_PERIOD_CHOICES)
+async def teamreport(interaction:discord.Interaction,period:app_commands.Choice[str]):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    start,end,label=team_report_bounds(period.value)
+    q=team_quality_totals(interaction.guild.id,start,end)
+
+    top_appts=period_rows_between(interaction.guild.id,start,end,'appointments',5)
+    top_setters=period_rows_between(interaction.guild.id,start,end,'setter_sales',5)
+    top_closers=period_rows_between(interaction.guild.id,start,end,'closer_sales',5)
+
+    e=discord.Embed(
+        title='📈 CHOSEN GENESIS — INSTANT TEAM REPORT',
+        description=f'**{label}** • {start} → {end}',
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    e.add_field(
+        name='📊 TEAM TOTALS',
+        value=(
+            f'📅 Appointments: **{q["appointments"]}**\n'
+            f'💰 Setter Sales: **{q["setter_sales"]}**\n'
+            f'🤝 Closer Sales: **{q["closer_sales"]}**\n'
+            f'🎯 Appt → Sale: **{pct(q["setter_sales"],q["appointments"])}%**'
+        ),
+        inline=False
+    )
+
+    e.add_field(
+        name='⚡ APPOINTMENT QUALITY',
+        value=(
+            f'⚡ Same Day: **{q["same_day"]} ({pct(q["same_day"],q["appointments"])}%)**\n'
+            f'⏰ Within 48: **{q["within_48"]} ({pct(q["within_48"],q["appointments"])}%)**\n'
+            f'📆 Over 48: **{q["over_48"]} ({pct(q["over_48"],q["appointments"])}%)**\n'
+            f'📄 Bills: **{q["bills"]} ({pct(q["bills"],q["appointments"])}%)**'
+        ),
+        inline=False
+    )
+
+    e.add_field(
+        name='📅 TOP 5 APPOINTMENT SETTERS',
+        value=fmt_ranked_members(interaction.guild,top_appts),
+        inline=False
+    )
+    e.add_field(
+        name='💰 TOP 5 SETTER SALES',
+        value=fmt_ranked_members(interaction.guild,top_setters),
+        inline=False
+    )
+    e.add_field(
+        name='🤝 TOP 5 CLOSER SALES',
+        value=fmt_ranked_members(interaction.guild,top_closers),
+        inline=False
+    )
+
+    # Reuse the deeper manager coaching/intelligence engine.
+    deep=manager_review_embed(
+        interaction.guild,start,end,
+        'unused',
+        'unused'
+    )
+
+    wanted_names={
+        '📌 MANAGER WATCHLIST',
+        '🆕 GREENIE PIPELINE',
+        '🎯 MONTHLY 3-DEAL STANDARD',
+        '🧠 COACHING DIAGNOSIS',
+        '✅ ATTENDANCE',
+    }
+    for field in deep.fields:
+        if field.name in wanted_names and len(e.fields)<25:
+            e.add_field(name=field.name,value=field.value,inline=False)
+
+    e.set_footer(text='Private instant manager view • Run /teamreport anytime')
+    await interaction.followup.send(embed=e,ephemeral=True)
+
 
 @bot.tree.command(name='midweekreview',description='Manager-only: send the current mid-week intelligence review to manager DMs')
 async def midweekreview(interaction:discord.Interaction):
@@ -3124,8 +3301,18 @@ async def midweekreview(interaction:discord.Interaction):
     if not is_manager(interaction.user):
         return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    await send_midweek_manager_review(interaction.guild,force=True)
-    await interaction.followup.send('✅ Mid-week review sent to manager DMs.',ephemeral=True)
+    result=await send_midweek_manager_review(interaction.guild,force=True)
+    if result.get('sent'):
+        await interaction.followup.send(
+            f'✅ Mid-week review delivered to **{result["delivered"]}** Manager DM(s).',
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            '⚠️ The report was generated, but I could not DM any Managers. '
+            'They may have DMs from server members turned off. Use `/teamreport` for the private in-Discord version.',
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name='weeklyreview',description='Manager-only: send the current week intelligence review to manager DMs')
@@ -4247,10 +4434,14 @@ async def appointment(
     )
 
     if first_setter(g)==setter.id:
-        if award_badge_count(g,setter.id,'🩸 First Blood',dkey()):
+        first_blood_new=award_badge_count(g,setter.id,'🩸 First Blood',dkey())
+        if first_blood_new:
             await announce_badge_milestone(interaction.guild,setter.id,'🩸 First Blood')
+            await main(
+                interaction.guild,
+                content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!'
+            )
         await set_holders(interaction.guild,'🩸 First Blood',[setter.id])
-        await main(interaction.guild,content=f'🩸 **FIRST BLOOD!** {setter.mention} set the first appointment of the day!')
 
     await refresh_daily_comp(interaction.guild)
 
