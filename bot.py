@@ -312,6 +312,10 @@ def setup_db():
     CREATE TABLE IF NOT EXISTS challenge_participants(
       challenge_id INTEGER,user_id INTEGER,score INTEGER DEFAULT 0,
       PRIMARY KEY(challenge_id,user_id));
+    CREATE TABLE IF NOT EXISTS challenge_adjustments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      challenge_id INTEGER,guild_id INTEGER,user_id INTEGER,amount INTEGER,
+      reason TEXT,adjusted_by INTEGER,created_at TEXT);
     CREATE TABLE IF NOT EXISTS greenie_progress(
       guild_id INTEGER,user_id INTEGER,
       pitch_url TEXT,pitch_filename TEXT,pitch_submitted_at TEXT,
@@ -328,6 +332,13 @@ def setup_db():
       submitted_at TEXT,status TEXT DEFAULT 'pending',
       reviewed_by INTEGER,reviewed_at TEXT,rejection_reason TEXT);
     ''')
+    # Appointment photo support (safe migration for existing Railway databases).
+    appt_cols={r['name'] for r in c.execute('PRAGMA table_info(appointment_events)')}
+    if 'photo_url' not in appt_cols:
+        c.execute('ALTER TABLE appointment_events ADD COLUMN photo_url TEXT')
+    if 'photo_filename' not in appt_cols:
+        c.execute('ALTER TABLE appointment_events ADD COLUMN photo_filename TEXT')
+
     # migrate old v1 stats safely
     cols={r['name'] for r in c.execute('PRAGMA table_info(stats)')}
     for name,typ in [('closer_sales','INTEGER DEFAULT 0'),('bills','INTEGER DEFAULT 0'),('within_48','INTEGER DEFAULT 0'),('same_day','INTEGER DEFAULT 0')]:
@@ -2822,6 +2833,7 @@ CHALLENGE_METRIC_CHOICES = [
     app_commands.Choice(name='Same-Day Appointments',value='same_day'),
     app_commands.Choice(name='Within 48 Hours',value='within_48'),
     app_commands.Choice(name='Bills Collected',value='bills'),
+    app_commands.Choice(name='📸 Homeowner Selfies',value='homeowner_selfie'),
 ]
 CHALLENGE_END_CHOICES = [
     app_commands.Choice(name='Manual End',value='manual'),
@@ -2841,6 +2853,7 @@ def challenge_metric_label(metric):
         'same_day':'Same-Days',
         'within_48':'Within 48 Hours',
         'bills':'Bills Collected',
+        'homeowner_selfie':'📸 Homeowner Selfies',
     }.get(metric,metric)
 
 def parse_challenge_deadline(date_text,time_text):
@@ -3426,6 +3439,83 @@ async def challenge(
     await render_challenge(interaction.guild,ch_row)
     await interaction.followup.send(
         f'✅ **{name}** created as Challenge **#{challenge_id}** with **{len(members)}** competitor(s).',
+        ephemeral=True
+    )
+
+
+
+@bot.tree.command(name='challenge_adjust',description='Manager-only: adjust a competitor score in one challenge')
+@app_commands.describe(
+    challenge_id='Challenge number shown on the challenge post',
+    member='Competitor whose challenge score should change',
+    amount='Points to add or subtract, e.g. 1 or -1',
+    reason='Optional reason for the adjustment'
+)
+async def challenge_adjust(
+    interaction:discord.Interaction,
+    challenge_id:int,
+    member:discord.Member,
+    amount:int,
+    reason:str|None=None
+):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',
+            ephemeral=True
+        )
+    if amount==0:
+        return await interaction.response.send_message(
+            '❌ Adjustment cannot be 0. Use a positive number to add points or a negative number to remove them.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    ch_row=challenge_row(challenge_id,interaction.guild.id)
+    if not ch_row:
+        return await interaction.followup.send('❌ Challenge not found.',ephemeral=True)
+    if ch_row['status']!='active':
+        return await interaction.followup.send('⚠️ You can only adjust an active challenge.',ephemeral=True)
+    if member.id not in challenge_participant_ids(challenge_id):
+        return await interaction.followup.send(
+            '❌ That person is not a competitor in this challenge.',
+            ephemeral=True
+        )
+
+    c=con()
+    current=c.execute(
+        'SELECT score FROM challenge_participants WHERE challenge_id=? AND user_id=?',
+        (challenge_id,member.id)
+    ).fetchone()
+    old_score=int(current['score'] or 0)
+    new_score=max(0,old_score+amount)
+    applied=new_score-old_score
+
+    c.execute(
+        'UPDATE challenge_participants SET score=? WHERE challenge_id=? AND user_id=?',
+        (new_score,challenge_id,member.id)
+    )
+    c.execute(
+        'INSERT INTO challenge_adjustments(challenge_id,guild_id,user_id,amount,reason,adjusted_by,created_at) '
+        'VALUES(?,?,?,?,?,?,?)',
+        (
+            challenge_id,interaction.guild.id,member.id,applied,
+            reason.strip()[:300] if reason else None,
+            interaction.user.id,datetime.now(timezone.utc).isoformat()
+        )
+    )
+    c.commit(); c.close()
+
+    fresh=challenge_row(challenge_id,interaction.guild.id)
+    await render_challenge(interaction.guild,fresh)
+    await evaluate_challenge(interaction.guild,fresh)
+
+    sign='+' if applied>0 else ''
+    reason_text=f' • {reason.strip()[:150]}' if reason and reason.strip() else ''
+    await interaction.followup.send(
+        f'✅ **{member.display_name}**: **{old_score} → {new_score}** '
+        f'({sign}{applied}) in **{ch_row["name"]}**.{reason_text}',
         ephemeral=True
     )
 
@@ -4370,6 +4460,7 @@ async def checkouts(interaction:discord.Interaction):
     bill_collected='Did you collect the electric bill?',
     within_48_hours='Is it within 48 hours?',
     same_day='Is it same day?',
+    photo='Optional photo (for example, a homeowner selfie)',
     message='Optional custom message to add to the announcement'
 )
 async def appointment(
@@ -4378,16 +4469,26 @@ async def appointment(
     bill_collected:bool,
     within_48_hours:bool,
     same_day:bool,
+    photo:discord.Attachment|None=None,
     message:str|None=None
 ):
     if not interaction.guild: return
     n=now(); g=interaction.guild.id
 
+    if photo is not None and not is_image_attachment(photo):
+        return await interaction.response.send_message(
+            '❌ The optional appointment photo needs to be an image.',
+            ephemeral=True
+        )
+
+    photo_url=photo.url if photo is not None else None
+    photo_filename=photo.filename if photo is not None else None
+
     c=con()
     c.execute(
-        'INSERT INTO appointment_events(guild_id,setter_id,bill_collected,within_48,same_day,local_date,week_key,created_at) '
-        'VALUES(?,?,?,?,?,?,?,?)',
-        (g,setter.id,int(bill_collected),int(within_48_hours),int(same_day),dkey(n.date()),wkey(n.date()),datetime.now(timezone.utc).isoformat())
+        'INSERT INTO appointment_events(guild_id,setter_id,bill_collected,within_48,same_day,local_date,week_key,created_at,photo_url,photo_filename) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?)',
+        (g,setter.id,int(bill_collected),int(within_48_hours),int(same_day),dkey(n.date()),wkey(n.date()),datetime.now(timezone.utc).isoformat(),photo_url,photo_filename)
     )
     c.commit(); c.close()
 
@@ -4404,6 +4505,10 @@ async def appointment(
         await update_challenges_for_event(interaction.guild,setter.id,'same_day',1)
     if within_48_hours:
         await update_challenges_for_event(interaction.guild,setter.id,'within_48',1)
+    if photo is not None:
+        # A photo attached to the appointment counts +1 only for active
+        # Homeowner Selfie challenges the setter is participating in.
+        await update_challenges_for_event(interaction.guild,setter.id,'homeowner_selfie',1)
 
     title,description=pick_announcement(APPOINTMENT_ANNOUNCEMENTS)
 
@@ -4424,6 +4529,9 @@ async def appointment(
     e.add_field(name='📄 Bill',value='✅ Collected' if bill_collected else '❌ No')
     e.add_field(name='⏰ Within 48 Hours',value='✅ Yes' if within_48_hours else '❌ No')
     e.add_field(name='⚡ Same Day',value='✅ Yes' if same_day else '❌ No')
+    if photo is not None:
+        e.add_field(name='📸 Photo',value='✅ Attached',inline=False)
+        e.set_image(url=photo.url)
 
     await interaction.response.send_message('Appointment logged ✅',ephemeral=True)
     await main(interaction.guild,embed=e)
