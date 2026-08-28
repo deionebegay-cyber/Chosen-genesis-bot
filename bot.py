@@ -1,4 +1,4 @@
-import os, sqlite3, random
+import os, sqlite3, random, calendar
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 import discord
