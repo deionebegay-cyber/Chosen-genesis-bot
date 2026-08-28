@@ -3234,77 +3234,121 @@ async def teamreport(interaction:discord.Interaction,period:app_commands.Choice[
 
     await interaction.response.defer(ephemeral=True)
 
-    start,end,label=team_report_bounds(period.value)
-    q=team_quality_totals(interaction.guild.id,start,end)
+    try:
+        start,end,label=team_report_bounds(period.value)
+        q=team_quality_totals(interaction.guild.id,start,end)
 
-    top_appts=period_rows_between(interaction.guild.id,start,end,'appointments',5)
-    top_setters=period_rows_between(interaction.guild.id,start,end,'setter_sales',5)
-    top_closers=period_rows_between(interaction.guild.id,start,end,'closer_sales',5)
+        top_appts=period_rows_between(interaction.guild.id,start,end,'appointments',5)
+        top_setters=period_rows_between(interaction.guild.id,start,end,'setter_sales',5)
+        top_closers=period_rows_between(interaction.guild.id,start,end,'closer_sales',5)
 
-    e=discord.Embed(
-        title='📈 CHOSEN GENESIS — INSTANT TEAM REPORT',
-        description=f'**{label}** • {start} → {end}',
-        timestamp=datetime.now(timezone.utc)
-    )
+        snapshots=[
+            setter_period_snapshot(interaction.guild,m,start,end)
+            for m in setter_members(interaction.guild)
+        ]
+        snapshots.sort(
+            key=lambda s:(-s['appointments'],-s['sales'],s['member'].display_name.lower())
+        )
 
-    e.add_field(
-        name='📊 TEAM TOTALS',
-        value=(
-            f'📅 Appointments: **{q["appointments"]}**\n'
-            f'💰 Setter Sales: **{q["setter_sales"]}**\n'
-            f'🤝 Closer Sales: **{q["closer_sales"]}**\n'
-            f'🎯 Appt → Sale: **{pct(q["setter_sales"],q["appointments"])}%**'
-        ),
-        inline=False
-    )
+        e=discord.Embed(
+            title='📈 CHOSEN GENESIS — INSTANT TEAM REPORT',
+            description=f'**{label}** • {start} → {end}',
+            timestamp=datetime.now(timezone.utc)
+        )
 
-    e.add_field(
-        name='⚡ APPOINTMENT QUALITY',
-        value=(
-            f'⚡ Same Day: **{q["same_day"]} ({pct(q["same_day"],q["appointments"])}%)**\n'
-            f'⏰ Within 48: **{q["within_48"]} ({pct(q["within_48"],q["appointments"])}%)**\n'
-            f'📆 Over 48: **{q["over_48"]} ({pct(q["over_48"],q["appointments"])}%)**\n'
-            f'📄 Bills: **{q["bills"]} ({pct(q["bills"],q["appointments"])}%)**'
-        ),
-        inline=False
-    )
+        e.add_field(
+            name='📊 TEAM TOTALS',
+            value=(
+                f'📅 Appointments: **{q["appointments"]}**\n'
+                f'💰 Setter Sales: **{q["setter_sales"]}**\n'
+                f'🤝 Closer Sales: **{q["closer_sales"]}**\n'
+                f'🎯 Appt → Sale: **{pct(q["setter_sales"],q["appointments"])}%**'
+            ),
+            inline=False
+        )
 
-    e.add_field(
-        name='📅 TOP 5 APPOINTMENT SETTERS',
-        value=fmt_ranked_members(interaction.guild,top_appts),
-        inline=False
-    )
-    e.add_field(
-        name='💰 TOP 5 SETTER SALES',
-        value=fmt_ranked_members(interaction.guild,top_setters),
-        inline=False
-    )
-    e.add_field(
-        name='🤝 TOP 5 CLOSER SALES',
-        value=fmt_ranked_members(interaction.guild,top_closers),
-        inline=False
-    )
+        e.add_field(
+            name='⚡ APPOINTMENT QUALITY',
+            value=(
+                f'⚡ Same Day: **{q["same_day"]} ({pct(q["same_day"],q["appointments"])}%)**\n'
+                f'⏰ Within 48: **{q["within_48"]} ({pct(q["within_48"],q["appointments"])}%)**\n'
+                f'📆 Over 48: **{q["over_48"]} ({pct(q["over_48"],q["appointments"])}%)**\n'
+                f'📄 Bills: **{q["bills"]} ({pct(q["bills"],q["appointments"])}%)**'
+            ),
+            inline=False
+        )
 
-    # Reuse the deeper manager coaching/intelligence engine.
-    deep=manager_review_embed(
-        interaction.guild,start,end,
-        'unused',
-        'unused'
-    )
+        e.add_field(
+            name='📅 TOP 5 APPOINTMENT SETTERS',
+            value=fmt_ranked_members(interaction.guild,top_appts)[:1024],
+            inline=False
+        )
+        e.add_field(
+            name='💰 TOP 5 SETTER SALES',
+            value=fmt_ranked_members(interaction.guild,top_setters)[:1024],
+            inline=False
+        )
+        e.add_field(
+            name='🤝 TOP 5 CLOSER SALES',
+            value=fmt_ranked_members(interaction.guild,top_closers)[:1024],
+            inline=False
+        )
 
-    wanted_names={
-        '📌 MANAGER WATCHLIST',
-        '🆕 GREENIE PIPELINE',
-        '🎯 MONTHLY 3-DEAL STANDARD',
-        '🧠 COACHING DIAGNOSIS',
-        '✅ ATTENDANCE',
-    }
-    for field in deep.fields:
-        if field.name in wanted_names and len(e.fields)<25:
-            e.add_field(name=field.name,value=field.value,inline=False)
+        # Keep the instant report compact enough for Discord's embed limits.
+        watch=[]
+        for s in snapshots:
+            if s['appointments'] < COACHING_MIN_APPTS:
+                continue
+            if s['over_48_pct'] >= 40:
+                watch.append(
+                    f'📅 **{s["member"].display_name}** — {s["over_48_pct"]:.0f}% of apps >48h'
+                )
+            elif s['sales'] == 0:
+                watch.append(
+                    f'🔎 **{s["member"].display_name}** — {s["appointments"]} apps / 0 sales'
+                )
+            elif s['conversion'] < 15:
+                watch.append(
+                    f'📉 **{s["member"].display_name}** — {s["conversion"]:.0f}% conversion'
+                )
+            elif s['conversion'] >= 35 and s['appointments'] < 8:
+                watch.append(
+                    f'📈 **{s["member"].display_name}** — strong conversion; push volume'
+                )
 
-    e.set_footer(text='Private instant manager view • Run /teamreport anytime')
-    await interaction.followup.send(embed=e,ephemeral=True)
+        if watch:
+            e.add_field(
+                name='📌 MANAGER WATCHLIST',
+                value='\n'.join(watch[:6])[:1024],
+                inline=False
+            )
+
+        pace=[]
+        for s in snapshots[:10]:
+            sales,expected,pace_label=monthly_pace_status(interaction.guild,s['member'])
+            pace.append(
+                f'**{s["member"].display_name}** — {sales}/{MONTHLY_SETTER_STANDARD} • {pace_label}'
+            )
+        if pace:
+            e.add_field(
+                name=f'🎯 MONTHLY {MONTHLY_SETTER_STANDARD}-DEAL STANDARD',
+                value='\n'.join(pace)[:1024],
+                inline=False
+            )
+
+        e.set_footer(text='Private instant manager view • Run /teamreport anytime')
+
+        await interaction.followup.send(embed=e,ephemeral=True)
+
+    except Exception as exc:
+        print(
+            f'[TEAMREPORT ERROR] guild={interaction.guild.id} '
+            f'user={interaction.user.id} error={type(exc).__name__}: {exc}'
+        )
+        await interaction.followup.send(
+            '⚠️ I hit an error generating the team report. The error was logged so it can be diagnosed.',
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name='midweekreview',description='Manager-only: send the current mid-week intelligence review to manager DMs')
