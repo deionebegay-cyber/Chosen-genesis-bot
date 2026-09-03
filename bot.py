@@ -2040,6 +2040,8 @@ async def send_weekly_manager_summary(guild,week_key,force=False):
         f'Private manager review for **{week_key}**.\nProduction, quality, conversion, pace, and accountability.'
     )
 
+    add_attendance_summary_to_embed(guild,e,start,end)
+
     top_setter_sales=period_rows_between(guild.id,start,end,'setter_sales',5)
     top_closer_sales=period_rows_between(guild.id,start,end,'closer_sales',5)
     e.add_field(name='💰 TOP 5 SETTER SALES',value=fmt_ranked_members(guild,top_setter_sales),inline=False)
@@ -2767,11 +2769,18 @@ async def on_ready():
         await weekly_kings(g)
         # Restore active challenges and their live messages after Railway restarts.
         await refresh_active_challenges(g)
-        if now().weekday()==0:
-            prev=now().date()-timedelta(days=1)
-            prev_wk=wkey(prev)
-            await weekly_recap(g,prev_wk)
-            await send_weekly_manager_summary(g,prev_wk)
+        # Official weekly close: Sunday 10 PM Arizona time.
+        # Catch-up behavior: after Sunday 10 PM and throughout Monday, keep
+        # attempting the just-finished week until at least one Manager DM succeeds.
+        n=now()
+        closed_week=None
+        if n.weekday()==6 and n.hour>=22:
+            closed_week=wkey(n.date())
+        elif n.weekday()==0:
+            closed_week=wkey(n.date()-timedelta(days=1))
+        if closed_week:
+            await weekly_recap(g,closed_week)
+            await send_weekly_manager_summary(g,closed_week)
         if now().day==1:
             prev_month_day=now().date().replace(day=1)-timedelta(days=1)
             await monthly_recap(g,prev_month_day)
@@ -3380,8 +3389,18 @@ async def weeklyreview(interaction:discord.Interaction):
         return await interaction.response.send_message('❌ Only users with the **Manager** role can use this.',ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     wk=wkey(now().date())
-    await send_weekly_manager_summary(interaction.guild,wk,force=True)
-    await interaction.followup.send('✅ Weekly review sent to manager DMs.',ephemeral=True)
+    result=await send_weekly_manager_summary(interaction.guild,wk,force=True)
+    if result and result.get('delivered',0)>0:
+        await interaction.followup.send(
+            f'✅ Weekly review sent to **{result["delivered"]}** Manager DM(s).',
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            '⚠️ The weekly review could not be delivered to any Manager DMs. '
+            'Check that Managers allow DMs from the server.',
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name='challenge',description='Manager-only: create a Chosen Genesis challenge')
@@ -4270,6 +4289,180 @@ async def checkin(interaction:discord.Interaction,photo:discord.Attachment):
         f'✅ Check-in recorded for **{local_time}**.',
         ephemeral=True
     )
+
+
+
+ATTENDANCE_PERIOD_CHOICES = [
+    app_commands.Choice(name='Today',value='today'),
+    app_commands.Choice(name='Yesterday',value='yesterday'),
+    app_commands.Choice(name='This Week',value='this_week'),
+    app_commands.Choice(name='Last Week',value='last_week'),
+]
+
+def attendance_period_bounds(value):
+    today=now().date()
+    if value=='today':
+        return today,today,'Today'
+    if value=='yesterday':
+        d=today-timedelta(days=1)
+        return d,d,'Yesterday'
+    if value=='this_week':
+        start=today-timedelta(days=today.weekday())
+        return start,today,'This Week'
+    if value=='last_week':
+        this_start=today-timedelta(days=today.weekday())
+        end=this_start-timedelta(days=1)
+        start=end-timedelta(days=6)
+        return start,end,'Last Week'
+    return today,today,'Today'
+
+def attendance_setters_for_period(guild,start,end):
+    # Current graduated setters plus anyone with attendance history in the period.
+    members={
+        m.id:m for m in guild.members
+        if not m.bot and has_named_role(m,'Setter') and not is_greenie(m)
+    }
+    c=con()
+    rows=c.execute(
+        'SELECT DISTINCT user_id FROM attendance_records WHERE guild_id=? AND local_date BETWEEN ? AND ?',
+        (guild.id,start.isoformat(),end.isoformat())
+    ).fetchall()
+    c.close()
+    for r in rows:
+        m=guild.get_member(r['user_id'])
+        if m and not m.bot:
+            members[m.id]=m
+    return sorted(members.values(),key=lambda m:m.display_name.lower())
+
+def attendance_day_snapshot(guild,member,day):
+    if day.weekday()==6:
+        return None
+    ds=day.isoformat()
+    c=con()
+    ar=c.execute(
+        'SELECT status,checkin_time,earned_freedom FROM attendance_records '
+        'WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild.id,member.id,ds)
+    ).fetchone()
+    ci=c.execute(
+        'SELECT local_time FROM checkins WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild.id,member.id,ds)
+    ).fetchone()
+    co=c.execute(
+        'SELECT status,checkout_time FROM checkout_records '
+        'WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild.id,member.id,ds)
+    ).fetchone()
+    raw_co=c.execute(
+        'SELECT local_time FROM checkouts WHERE guild_id=? AND user_id=? AND local_date=?',
+        (guild.id,member.id,ds)
+    ).fetchone()
+    c.close()
+
+    status=(ar['status'] if ar else None)
+    checkin_time=(ar['checkin_time'] if ar and ar['checkin_time'] else (ci['local_time'] if ci else None))
+    checkout_status=(co['status'] if co else None)
+    checkout_time=(co['checkout_time'] if co and co['checkout_time'] else (raw_co['local_time'] if raw_co else None))
+
+    # Historical rows are the source of truth. If a raw check-in exists but the
+    # finalized attendance row is absent, count it as checked in rather than missed.
+    if not status and checkin_time:
+        status='on_time'
+    if not checkout_status and checkout_time:
+        checkout_status='checked_out'
+
+    return {
+        'status':status or 'missed',
+        'checkin_time':checkin_time,
+        'checkout_status':checkout_status or 'missed',
+        'checkout_time':checkout_time,
+    }
+
+def weekly_attendance_lines(guild,start,end):
+    lines=[]
+    for member in attendance_setters_for_period(guild,start,end):
+        on=late=missed=checkouts=expected=0
+        d=start
+        while d<=end:
+            if d.weekday()!=6:
+                snap=attendance_day_snapshot(guild,member,d)
+                expected+=1
+                st=snap['status']
+                if st=='late':
+                    late+=1
+                elif st=='missed':
+                    missed+=1
+                else:
+                    on+=1
+                if snap['checkout_status']!='missed':
+                    checkouts+=1
+            d+=timedelta(days=1)
+        lines.append(
+            f'**{member.display_name}** — ✅ {on} | ⚠️ {late} | ❌ {missed} | 🚪 {checkouts}/{expected}'
+        )
+    return lines
+
+def add_attendance_summary_to_embed(guild,e,start,end):
+    s=datetime.strptime(start,'%Y-%m-%d').date() if isinstance(start,str) else start
+    en=datetime.strptime(end,'%Y-%m-%d').date() if isinstance(end,str) else end
+    lines=weekly_attendance_lines(guild,s,en)
+    if lines:
+        e.add_field(
+            name='🕐 ATTENDANCE SUMMARY',
+            value='\n'.join(lines[:12])[:1024],
+            inline=False
+        )
+    return e
+
+@bot.tree.command(name='attendance',description='Manager-only: view daily or weekly setter attendance')
+@app_commands.describe(period='Choose the attendance period')
+@app_commands.choices(period=ATTENDANCE_PERIOD_CHOICES)
+async def attendance(interaction:discord.Interaction,period:app_commands.Choice[str]):
+    if not interaction.guild:
+        return await interaction.response.send_message('Use this command inside the server.',ephemeral=True)
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can use this.',ephemeral=True
+        )
+    await interaction.response.defer(ephemeral=True)
+    try:
+        start,end,label=attendance_period_bounds(period.value)
+        e=discord.Embed(
+            title='🕐 CHOSEN GENESIS — ATTENDANCE',
+            description=f'**{label}** • {start.isoformat()} → {end.isoformat()}',
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        if start==end:
+            if start.weekday()==6:
+                e.add_field(name='☀️ OFF DAY',value='Sunday — no attendance accountability.',inline=False)
+            else:
+                rows=[]
+                for member in attendance_setters_for_period(interaction.guild,start,end):
+                    s=attendance_day_snapshot(interaction.guild,member,start)
+                    icon='⚠️' if s['status']=='late' else ('❌' if s['status']=='missed' else '✅')
+                    ci=f' • IN {s["checkin_time"]}' if s['checkin_time'] else ''
+                    co_icon='🚪' if s['checkout_status']!='missed' else '❌'
+                    co=f'{co_icon} OUT {s["checkout_time"]}' if s['checkout_time'] else f'{co_icon} OUT'
+                    rows.append(f'{icon} **{member.display_name}**{ci} • {co}')
+                e.add_field(name='SETTER ATTENDANCE',value='\n'.join(rows)[:1024] if rows else 'No tracked setters.',inline=False)
+        else:
+            lines=weekly_attendance_lines(interaction.guild,start,end)
+            e.add_field(
+                name='WEEKLY SUMMARY',
+                value='\n'.join(lines)[:1024] if lines else 'No tracked setters.',
+                inline=False
+            )
+            e.add_field(
+                name='KEY',
+                value='✅ On Time • ⚠️ Late • ❌ Missed • 🚪 Checkouts completed / workdays',
+                inline=False
+            )
+        e.set_footer(text='Private Manager view • Greenies and Sundays excluded from accountability')
+        await interaction.followup.send(embed=e,ephemeral=True)
+    except Exception as exc:
+        print(f'[ATTENDANCE ERROR] guild={interaction.guild.id} error={type(exc).__name__}: {exc}')
+        await interaction.followup.send('⚠️ I hit an error generating attendance. Check Railway logs for ATTENDANCE ERROR.',ephemeral=True)
 
 
 @bot.tree.command(name='checkins',description='Manager-only: see today’s setter check-ins')
