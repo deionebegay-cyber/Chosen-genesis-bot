@@ -3273,6 +3273,88 @@ def pct(n,d):
 
 MANUAL_BADGE_CHOICES = [app_commands.Choice(name=x,value=x) for x in DAILY+STREAK+WEEKLY]
 
+KING_CHOICES = [
+    app_commands.Choice(name='👑 Setter King',value='setter'),
+    app_commands.Choice(name='👑 Closer King',value='closer'),
+]
+
+@bot.tree.command(name='setking',description='Manager-only: manually change the current Setter King or Closer King')
+@app_commands.describe(
+    king='Which crown to change',
+    member='Who should wear the crown'
+)
+@app_commands.choices(king=KING_CHOICES)
+async def setking(
+    interaction:discord.Interaction,
+    king:app_commands.Choice[str],
+    member:discord.Member
+):
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            'Use this command inside the server.',
+            ephemeral=True
+        )
+    if not is_manager(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Only users with the **Manager** role can change Kings.',
+            ephemeral=True
+        )
+    if member.bot:
+        return await interaction.response.send_message(
+            '❌ Choose a real team member.',
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    role_name='👑 Setter King' if king.value=='setter' else '👑 Closer King'
+    crown_role=await role(interaction.guild,role_name)
+
+    # Cosmetic/manual override only:
+    # - remove this specific crown from all current holders
+    # - give it to the selected member
+    # - do NOT create badge history
+    # - do NOT touch appointments, sales, badge points, leaderboards, or weekly results
+    removed=[]
+    for current in list(crown_role.members):
+        if current.id==member.id:
+            continue
+        try:
+            await current.remove_roles(
+                crown_role,
+                reason=f'Manual {role_name} change by {interaction.user}'
+            )
+            removed.append(current.display_name)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                f'⚠️ I could not remove **{role_name}** from {current.mention}. '
+                'Move the bot role above the King roles in Discord.',
+                ephemeral=True
+            )
+
+    if crown_role not in member.roles:
+        try:
+            await member.add_roles(
+                crown_role,
+                reason=f'Manual {role_name} change by {interaction.user}'
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                f'⚠️ I could not give **{role_name}** to {member.mention}. '
+                'Move the bot role above the King roles in Discord.',
+                ephemeral=True
+            )
+
+    await interaction.followup.send(
+        f'✅ {member.mention} is now the **{role_name}**.\n'
+        'This only changes the current crown role — **no stats, sales, appointments, '
+        'badge points, or weekly results were changed**. The next automatic weekly '
+        'King calculation will crown the actual winner normally.',
+        ephemeral=True
+    )
+
+
+
 
 @bot.tree.command(name='teamreport',description='Manager-only: instantly view team performance')
 @app_commands.describe(period='Choose the report period')
