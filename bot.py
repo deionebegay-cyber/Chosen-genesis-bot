@@ -1835,6 +1835,8 @@ def monthly_pace_status(guild,member,as_of=None):
 
     if sales>=MONTHLY_SETTER_STANDARD:
         label='✅ Standard Hit'
+    elif as_of.day==days_in_month:
+        label='🔴 Below Standard'
     elif sales>=expected:
         label='🟢 On Pace'
     elif sales+0.5>=expected:
@@ -3187,8 +3189,15 @@ def team_report_bounds(period):
     return start.isoformat(),end.isoformat(),label
 
 def team_quality_totals(guild_id,start,end):
+    """
+    One source of truth for /teamreport totals.
+
+    Raw events + dated corrections/backfills are included so the report matches
+    the same official numbers used by the team goal/leaderboards.
+    """
     c=con()
-    r=c.execute(
+
+    raw=c.execute(
         'SELECT COUNT(*) appts,'
         'COALESCE(SUM(same_day),0) same_day,'
         'COALESCE(SUM(within_48),0) within_48,'
@@ -3196,31 +3205,67 @@ def team_quality_totals(guild_id,start,end):
         'FROM appointment_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
         (guild_id,start,end)
     ).fetchone()
-    sales=c.execute(
+
+    def stat_adj(stat_name):
+        return c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
+            'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
+            (guild_id,stat_name,start,end)
+        ).fetchone()['v'] or 0
+
+    # Official team sales include historical/backfilled sales that were marked
+    # to count toward the team sales goal.
+    raw_sales=c.execute(
         'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND local_date BETWEEN ? AND ?',
         (guild_id,start,end)
-    ).fetchone()['c']
-    closer_sales=c.execute(
-        'SELECT COUNT(*) c FROM sale_events WHERE guild_id=? AND closer_id>0 AND local_date BETWEEN ? AND ?',
+    ).fetchone()['c'] or 0
+    team_sales_adj=c.execute(
+        'SELECT COALESCE(SUM(amount),0) v FROM team_sale_adjustments '
+        'WHERE guild_id=? AND local_date BETWEEN ? AND ?',
         (guild_id,start,end)
-    ).fetchone()['c']
+    ).fetchone()['v'] or 0
+
+    # Closer sales are credited per closer, so include closer stat corrections.
+    raw_closer_sales=c.execute(
+        'SELECT COUNT(*) c FROM sale_events '
+        'WHERE guild_id=? AND closer_id>0 AND local_date BETWEEN ? AND ?',
+        (guild_id,start,end)
+    ).fetchone()['c'] or 0
+    closer_adj=stat_adj('closer_sales')
     c.close()
 
-    appts=int(r['appts'] or 0)
-    same_day=int(r['same_day'] or 0)
-    within_48=int(r['within_48'] or 0)
-    bills=int(r['bills'] or 0)
+    appts=max(0,int(round(float(raw['appts'] or 0)+float(stat_adj_safe(guild_id,'appointments',start,end)))))
+    same_day=max(0,int(round(float(raw['same_day'] or 0)+float(stat_adj_safe(guild_id,'same_day',start,end)))))
+    within_48=max(0,int(round(float(raw['within_48'] or 0)+float(stat_adj_safe(guild_id,'within_48',start,end)))))
+    bills=max(0,int(round(float(raw['bills'] or 0)+float(stat_adj_safe(guild_id,'bills',start,end)))))
+
+    # Quality metrics cannot logically exceed total appointments.
+    same_day=min(appts,same_day)
+    within_48=min(appts,max(within_48,same_day))
+    bills=min(appts,bills)
     over_48=max(0,appts-within_48)
 
     return {
         'appointments':appts,
-        'setter_sales':int(sales or 0),
-        'closer_sales':int(closer_sales or 0),
+        'setter_sales':max(0,int(raw_sales+team_sales_adj)),
+        'closer_sales':max(0,int(round(float(raw_closer_sales)+float(closer_adj)))),
         'same_day':same_day,
         'within_48':within_48,
         'over_48':over_48,
         'bills':bills,
     }
+
+def stat_adj_safe(guild_id,stat_name,start,end):
+    c=con()
+    try:
+        r=c.execute(
+            'SELECT COALESCE(SUM(amount),0) v FROM stat_adjustments '
+            'WHERE guild_id=? AND stat_name=? AND local_date BETWEEN ? AND ?',
+            (guild_id,stat_name,start,end)
+        ).fetchone()
+        return float(r['v'] or 0)
+    finally:
+        c.close()
 
 def pct(n,d):
     return 0 if not d else round((n/d)*100)
@@ -3333,8 +3378,13 @@ async def teamreport(interaction:discord.Interaction,period:app_commands.Choice[
             )
 
         pace=[]
+        report_end_date=datetime.strptime(end,'%Y-%m-%d').date()
         for s in snapshots[:10]:
-            sales,expected,pace_label=monthly_pace_status(interaction.guild,s['member'])
+            sales,expected,pace_label=monthly_pace_status(
+                interaction.guild,
+                s['member'],
+                as_of=report_end_date
+            )
             pace.append(
                 f'**{s["member"].display_name}** — {sales}/{MONTHLY_SETTER_STANDARD} • {pace_label}'
             )
